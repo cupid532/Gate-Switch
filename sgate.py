@@ -34,6 +34,11 @@ from typing import Any
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser()
 CONFIG_PATH = CODEX_HOME / "config.toml"
 CHANNELS_PATH = CODEX_HOME / "codex-channels.json"
+OPENCODE_CONFIG_PATH = Path(os.environ.get(
+    "OPENCODE_CONFIG", Path.home() / ".config" / "opencode" / "opencode.json"
+)).expanduser()
+OPENCODE_CREDENTIALS_DIR = OPENCODE_CONFIG_PATH.parent / ".sgate"
+OPENCODE_CREDENTIALS_PATH = OPENCODE_CREDENTIALS_DIR / "api-key"
 # Keep the legacy service name so upgrades retain existing Keychain secrets.
 KEYCHAIN_PREFIX = "codex-channel"
 SCRIPT_PATH = Path(__file__).resolve()
@@ -698,6 +703,211 @@ def write_config(content: str) -> None:
     os.chmod(tmp, 0o600)
     os.replace(tmp, CONFIG_PATH)
     os.chmod(CONFIG_PATH, 0o600)
+
+
+def opencode_provider_id(slug: str) -> str:
+    return f"sgate_{slug.replace('-', '_')}"
+
+
+def opencode_read_config() -> dict[str, Any]:
+    if not OPENCODE_CONFIG_PATH.exists():
+        return {"$schema": "https://opencode.ai/config.json"}
+    try:
+        value = json.loads(OPENCODE_CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        die(f"无法读取 OpenCode 配置 {OPENCODE_CONFIG_PATH}：{exc}")
+    if not isinstance(value, dict):
+        die(f"OpenCode 配置必须是 JSON 对象：{OPENCODE_CONFIG_PATH}")
+    return value
+
+
+def opencode_backup_config() -> Path | None:
+    if not OPENCODE_CONFIG_PATH.exists():
+        return None
+    backup = OPENCODE_CONFIG_PATH.with_name(f"opencode.json.sgate-{now_stamp()}.bak")
+    shutil.copy2(OPENCODE_CONFIG_PATH, backup)
+    return backup
+
+
+def opencode_write_config(config: dict[str, Any]) -> None:
+    OPENCODE_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = OPENCODE_CONFIG_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, OPENCODE_CONFIG_PATH)
+    os.chmod(OPENCODE_CONFIG_PATH, 0o600)
+
+
+def opencode_write_runtime_key(slug: str) -> None:
+    """Materialize the selected Keychain secret for OpenCode's file interpolation."""
+    key = keychain_get(slug)
+    OPENCODE_CREDENTIALS_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(OPENCODE_CREDENTIALS_DIR, 0o700)
+    tmp = OPENCODE_CREDENTIALS_PATH.with_suffix(".tmp")
+    tmp.write_text(key + "\n", encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, OPENCODE_CREDENTIALS_PATH)
+    os.chmod(OPENCODE_CREDENTIALS_PATH, 0o600)
+
+
+def opencode_provider_block(channel: dict[str, Any]) -> dict[str, Any]:
+    efforts = _normalized_values(channel.get("selected_efforts"), EFFORTS) or list(EFFORTS)
+    models = _normalized_values(channel.get("selected_models")) or [str(channel.get("model") or DEFAULT_MODEL)]
+    variants = {effort: {"reasoningEffort": effort} for effort in efforts}
+    return {
+        "name": channel.get("name", channel["slug"]),
+        "npm": "@ai-sdk/openai-compatible",
+        "options": {
+            "apiKey": "{file:" + str(OPENCODE_CREDENTIALS_PATH) + "}",
+            "baseURL": str(channel["base_url"]).rstrip("/") + "/v1" if not str(channel["base_url"]).rstrip("/").endswith("/v1") else str(channel["base_url"]).rstrip("/"),
+            "setCacheKey": True,
+        },
+        "models": {
+            model: {
+                "name": model,
+                "reasoning": True,
+                "tool_call": True,
+                "variants": variants,
+            }
+            for model in models
+        },
+    }
+
+
+def current_opencode_info() -> dict[str, Any]:
+    config = opencode_read_config()
+    model_ref = str(config.get("model", ""))
+    provider_id_value, _, model = model_ref.partition("/")
+    provider = config.get("provider", {}).get(provider_id_value, {}) if isinstance(config.get("provider"), dict) else {}
+    variants = {}
+    if isinstance(provider, dict) and isinstance(provider.get("models"), dict) and model in provider["models"]:
+        variants = provider["models"][model].get("variants", {}) or {}
+    build_agent = config.get("agent", {}).get("build", {}) if isinstance(config.get("agent"), dict) else {}
+    effort = str(build_agent.get("variant", "")) if isinstance(build_agent, dict) else ""
+    if effort not in EFFORTS and isinstance(variants, dict) and variants:
+        effort = next(iter(variants), "")
+    return {
+        "provider_id": provider_id_value,
+        "provider": provider if isinstance(provider, dict) else {},
+        "model": model or "(未设置)",
+        "reasoning_effort": effort or "(未设置)",
+    }
+
+
+def select_opencode_channel(slug: str, *, model: str | None = None, effort: str | None = None) -> None:
+    data = load_channels()
+    channel = data.get("channels", {}).get(slug)
+    if not channel:
+        die(f"渠道不存在：{slug}。先执行 add。")
+    model = model or str(channel.get("model") or DEFAULT_MODEL)
+    effort = effort or str(channel.get("reasoning_effort") or DEFAULT_EFFORT)
+    if effort not in EFFORTS:
+        die(f"推理强度必须是：{', '.join(EFFORTS)}")
+    selected_models = _normalized_values(channel.get("selected_models")) or [model]
+    if model not in selected_models:
+        selected_models.append(model)
+    selected_efforts = _normalized_values(channel.get("selected_efforts"), EFFORTS) or list(EFFORTS)
+    if effort not in selected_efforts:
+        selected_efforts.append(effort)
+    channel.update({"model": model, "reasoning_effort": effort, "selected_models": selected_models,
+                    "selected_efforts": selected_efforts, "enabled": True,
+                    "last_enabled_at": datetime.now(timezone.utc).isoformat()})
+    for item in data.get("channels", {}).values():
+        if item is not channel:
+            item["enabled"] = False
+    data["active"] = slug
+    save_channels(data)
+    opencode_write_runtime_key(slug)
+    config = opencode_read_config()
+    config["$schema"] = "https://opencode.ai/config.json"
+    provider_id_value = opencode_provider_id(slug)
+    config.setdefault("provider", {})[provider_id_value] = opencode_provider_block(channel)
+    model_ref = f"{provider_id_value}/{model}"
+    config["model"] = model_ref
+    build_agent = config.setdefault("agent", {}).setdefault("build", {})
+    if isinstance(build_agent, dict):
+        build_agent["model"] = model_ref
+        build_agent["variant"] = effort
+    backup = opencode_backup_config()
+    opencode_write_config(config)
+    if backup:
+        print(f"已备份 OpenCode 配置：{backup}")
+    print(f"已启用 OpenCode：{channel.get('name', slug)} ({slug})")
+    print(f"  Model：{model}\n  Reasoning：{effort}\n  配置：{OPENCODE_CONFIG_PATH}")
+    print("  OpenCode 需要重启后读取新配置。")
+
+
+def configure_opencode_channel() -> None:
+    slug = choose_channel("OpenCode：选择渠道")
+    if not slug:
+        return
+    data = load_channels()
+    channel = data["channels"][slug]
+    models = _normalized_values(channel.get("models")) or _normalized_values(channel.get("selected_models"))
+    model_pick = choose_models(models, defaults=_normalized_values(channel.get("selected_models")), default_value=channel.get("model"))
+    if not model_pick:
+        return
+    selected_models, model = model_pick
+    effort_pick = choose_efforts(defaults=_normalized_values(channel.get("selected_efforts"), EFFORTS), default_value=channel.get("reasoning_effort"))
+    if not effort_pick:
+        return
+    selected_efforts, effort = effort_pick
+    channel["selected_models"] = selected_models
+    channel["selected_efforts"] = selected_efforts
+    channel["model"] = model
+    channel["reasoning_effort"] = effort
+    save_channels(data)
+    select_opencode_channel(slug, model=model, effort=effort)
+
+
+def print_opencode_status() -> None:
+    info = current_opencode_info()
+    print("\n当前 OpenCode 配置")
+    print(f"  配置：{OPENCODE_CONFIG_PATH}")
+    print(f"  provider：{info['provider_id'] or '(未设置)'}")
+    print(f"  Model：{info['model']}")
+    print(f"  Reasoning：{info['reasoning_effort']}")
+
+
+def opencode_interactive() -> None:
+    while True:
+        try:
+            info = current_opencode_info()
+            title = (
+                "OpenCode 渠道切换器\n"
+                f"  当前：{info['provider_id'] or '(未设置)'} · {info['model']} · reasoning={info['reasoning_effort']}"
+            )
+            choice = terminal_menu(title, [
+                ("use", "[切换] 启用渠道，并选择模型 / 推理强度"),
+                ("configure", "[配置] 重新选择模型 / 推理强度"),
+                ("status", "[状态] 查看 OpenCode 实际配置"),
+                ("back", "[返回] 回到工具选择"),
+            ], default="use")
+            if choice in (None, "back"):
+                return
+            if choice in ("use", "configure"):
+                configure_opencode_channel()
+            elif choice == "status":
+                print_opencode_status()
+            pause_after_action()
+        except (KeyboardInterrupt, EOFError):
+            print("\n已退出。")
+            return
+
+
+def engine_interactive() -> None:
+    while True:
+        choice = terminal_menu("SGate 渠道切换器\n  请选择要配置的工具", [
+            ("codex", "[Codex] 切换 Codex / ChatGPT.app 渠道"),
+            ("opencode", "[OpenCode] 切换 OpenCode 渠道"),
+            ("exit", "[退出] 关闭菜单"),
+        ], default="codex")
+        if choice in (None, "exit"):
+            return
+        if choice == "codex":
+            interactive()
+        elif choice == "opencode":
+            opencode_interactive()
 
 
 def models_url(base_url: str) -> str:
@@ -1696,6 +1906,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_run = sub.add_parser("run", help="用当前全局配置启动 standalone codex")
     p_run.add_argument("args", nargs=argparse.REMAINDER)
 
+    p_oc = sub.add_parser("opencode", help="交互配置 OpenCode 渠道")
+    p_oc.add_argument("action", nargs="?", choices=("use", "configure", "status"), default=None)
+    p_oc.add_argument("slug", nargs="?")
+    p_oc.add_argument("--model")
+    p_oc.add_argument("--reasoning", choices=EFFORTS)
+
     p_token = sub.add_parser("token", help=argparse.SUPPRESS)
     p_token.add_argument("slug")
     return parser
@@ -1704,7 +1920,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
     if not args.command:
-        interactive()
+        engine_interactive()
     elif args.command == "add":
         add_channel(args)
     elif args.command == "use":
@@ -1736,6 +1952,17 @@ def main() -> None:
         app_doctor()
     elif args.command == "run":
         os.execvp("codex", ["codex", *args.args])
+    elif args.command == "opencode":
+        if args.action == "status":
+            print_opencode_status()
+        elif args.action == "use":
+            if not args.slug:
+                die("OpenCode use 需要渠道 slug")
+            select_opencode_channel(args.slug, model=args.model, effort=args.reasoning)
+        elif args.action == "configure":
+            configure_opencode_channel()
+        else:
+            opencode_interactive()
     elif args.command == "token":
         token_command(args.slug)
 

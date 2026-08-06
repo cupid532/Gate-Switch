@@ -1,6 +1,6 @@
 # Gate Switch（`sgate`）
 
-`sgate` 是一个面向 macOS 的 Codex / ChatGPT.app 渠道切换脚本。它可以保存多个 OpenAI Responses API 兼容渠道，自动拉取模型，并通过终端复选界面配置 ChatGPT.app 中可切换的模型与推理强度。
+`sgate` 是一个面向 macOS 的 Codex / OpenCode / ChatGPT.app 渠道切换脚本。它可以保存多个 OpenAI 兼容渠道，自动拉取模型，并通过终端复选界面配置模型与推理强度。
 
 ## 快速安装
 
@@ -34,6 +34,9 @@ sgate
 - 应用交互配置后立即重启 ChatGPT.app，避免配置写入但运行中 App 未重新加载。
 - 可“停用”渠道但保留渠道记录和 Keychain 密钥，下次可以直接重新启用。
 - 每次修改前自动备份 Codex 配置。
+- 启动后可先选择 `Codex` 或 `OpenCode`，两套配置互不覆盖。
+- OpenCode 使用合法的 `provider`、`model` 和 `agent.build.variant` 配置，保留 `minimal`、`low`、`medium`、`high`、`xhigh` 思考强度。
+- OpenCode API Key 从 Keychain 写入权限为 `0600` 的运行时文件，并通过 `{file:...}` 引用，不写入 `opencode.json`。
 
 ## 交互按键
 
@@ -49,6 +52,15 @@ sgate
 ```sh
 # 打开交互菜单
 sgate
+
+# 直接打开 OpenCode 菜单
+sgate opencode
+
+# 直接切换 OpenCode 渠道和思考强度
+sgate opencode use fusiongate --model gpt-5.6-sol --reasoning xhigh
+
+# 查看 OpenCode 当前实际配置
+sgate opencode status
 
 # 查看实际配置和已保存渠道
 sgate status
@@ -93,8 +105,10 @@ sgate remove <slug>
 - 渠道记录：`~/.codex/codex-channels.json`
 - SGate 模型目录：`~/.codex/sgate-model-catalog.json`
 - 配置备份：`~/.codex/config.toml.sgate-*.bak`
+- OpenCode 配置：`~/.config/opencode/opencode.json`（可由 `OPENCODE_CONFIG` 覆盖）
+- OpenCode 运行时密钥：`~/.config/opencode/.sgate/api-key`
 
-ChatGPT.app 的 app-server 不会热加载 `model_catalog_json`。因此交互模式在最终确认后会直接重启 ChatGPT.app；命令行模式可添加 `--restart-app`。
+ChatGPT.app 和 OpenCode 都不会让已经运行的会话热切换配置。切换后请重启对应工具；Codex 交互模式仍会按原逻辑处理 ChatGPT.app，OpenCode 切换完成后会明确提示重启。
 
 为了兼容旧版 `codex-channel`，SGate 会继续读取原来的渠道文件、Keychain 服务名以及旧备份，不需要重新录入 API Key。
 

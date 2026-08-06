@@ -22,12 +22,20 @@ class SGateTests(unittest.TestCase):
             "CODEX_HOME": sgate.CODEX_HOME,
             "CONFIG_PATH": sgate.CONFIG_PATH,
             "CHANNELS_PATH": sgate.CHANNELS_PATH,
+            "OPENCODE_CONFIG_PATH": sgate.OPENCODE_CONFIG_PATH,
+            "OPENCODE_CREDENTIALS_DIR": sgate.OPENCODE_CREDENTIALS_DIR,
+            "OPENCODE_CREDENTIALS_PATH": sgate.OPENCODE_CREDENTIALS_PATH,
+            "keychain_get": sgate.keychain_get,
             "chatgpt_is_running": sgate.chatgpt_is_running,
             "ccswitch_is_running": sgate.ccswitch_is_running,
         }
         sgate.CODEX_HOME = root
         sgate.CONFIG_PATH = root / "config.toml"
         sgate.CHANNELS_PATH = root / "codex-channels.json"
+        sgate.OPENCODE_CONFIG_PATH = root / "opencode.json"
+        sgate.OPENCODE_CREDENTIALS_DIR = root / ".sgate"
+        sgate.OPENCODE_CREDENTIALS_PATH = sgate.OPENCODE_CREDENTIALS_DIR / "api-key"
+        sgate.keychain_get = lambda slug: f"secret-for-{slug}"
         sgate.chatgpt_is_running = lambda: False
         sgate.ccswitch_is_running = lambda: False
         sgate.CONFIG_PATH.write_text(
@@ -125,6 +133,23 @@ class SGateTests(unittest.TestCase):
         finally:
             os.close(read_fd)
             os.close(write_fd)
+
+    def test_opencode_channel_writes_provider_model_and_variant(self) -> None:
+        sgate.select_opencode_channel(
+            "test",
+            model="model-2",
+            effort="xhigh",
+        )
+        config = json.loads(sgate.OPENCODE_CONFIG_PATH.read_text(encoding="utf-8"))
+        provider_id = "sgate_test"
+        self.assertEqual(config["model"], f"{provider_id}/model-2")
+        self.assertEqual(config["agent"]["build"]["variant"], "xhigh")
+        self.assertEqual(config["agent"]["build"]["model"], f"{provider_id}/model-2")
+        provider = config["provider"][provider_id]
+        self.assertEqual(provider["options"]["apiKey"], "{file:" + str(sgate.OPENCODE_CREDENTIALS_PATH) + "}")
+        self.assertEqual(provider["models"]["model-2"]["variants"]["xhigh"]["reasoningEffort"], "xhigh")
+        self.assertEqual(sgate.OPENCODE_CREDENTIALS_PATH.read_text(encoding="utf-8").strip(), "secret-for-test")
+        self.assertEqual(sgate.current_opencode_info()["reasoning_effort"], "xhigh")
 
 
 if __name__ == "__main__":
