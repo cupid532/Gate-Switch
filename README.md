@@ -35,8 +35,9 @@ sgate
 - 可“停用”渠道但保留渠道记录和 Keychain 密钥，下次可以直接重新启用。
 - 每次修改前自动备份 Codex 配置。
 - 启动后可先选择 `Codex` 或 `OpenCode`，两套配置互不覆盖。
+- 交互菜单将“渠道管理”和“工具配置”分开：新增、删除、总览、连接检查在外层完成；进入 Codex/OpenCode 后再选择模型和推理强度。
 - OpenCode 使用合法的 `provider`、`model` 和 `agent.build.variant` 配置，保留 `minimal`、`low`、`medium`、`high`、`xhigh` 思考强度。
-- OpenCode API Key 从 Keychain 写入权限为 `0600` 的运行时文件，并通过 `{file:...}` 引用，不写入 `opencode.json`。
+- OpenCode API Key 仍以 macOS Keychain 为密钥源；运行 OpenCode 时写入每渠道独立、权限为 `0600` 的临时引用文件，并通过 `{file:...}` 引用，不写入 `opencode.json`。
 
 ## 交互按键
 
@@ -53,6 +54,15 @@ sgate
 # 打开交互菜单
 sgate
 
+# 交互菜单层级
+# SGate
+# ├─ 渠道管理：新增 / 删除 / 总览 / 检查
+# ├─ Codex：选择渠道、模型、推理强度并启用
+# └─ OpenCode：选择渠道、模型、推理强度并启用
+
+# 直接打开外层渠道管理菜单
+sgate channels
+
 # 直接打开 OpenCode 菜单
 sgate opencode
 
@@ -66,8 +76,11 @@ sgate opencode status
 sgate status
 sgate list
 
-# 添加渠道并自动拉取模型
+# 命令行添加渠道并自动拉取模型；命令行模式仍可直接进入选择器
 sgate add
+
+# 交互菜单中的“新增渠道”只保存渠道、Key 和模型缓存；
+# 随后到 Codex 或 OpenCode 菜单分别勾选各自的模型与推理强度。
 
 # 启用已保存渠道
 sgate use <slug>
@@ -106,7 +119,7 @@ sgate remove <slug>
 - SGate 模型目录：`~/.codex/sgate-model-catalog.json`
 - 配置备份：`~/.codex/config.toml.sgate-*.bak`
 - OpenCode 配置：`~/.config/opencode/opencode.json`（可由 `OPENCODE_CONFIG` 覆盖）
-- OpenCode 运行时密钥：`~/.config/opencode/.sgate/api-key`
+- OpenCode 运行时密钥：`~/.config/opencode/.sgate/<channel>-api-key`
 
 ChatGPT.app 和 OpenCode 都不会让已经运行的会话热切换配置。切换后请重启对应工具；Codex 交互模式仍会按原逻辑处理 ChatGPT.app，OpenCode 切换完成后会明确提示重启。
 

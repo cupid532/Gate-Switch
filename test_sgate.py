@@ -6,6 +6,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 SCRIPT = Path(__file__).with_name("sgate.py")
 spec = importlib.util.spec_from_file_location("sgate", SCRIPT)
@@ -24,8 +25,9 @@ class SGateTests(unittest.TestCase):
             "CHANNELS_PATH": sgate.CHANNELS_PATH,
             "OPENCODE_CONFIG_PATH": sgate.OPENCODE_CONFIG_PATH,
             "OPENCODE_CREDENTIALS_DIR": sgate.OPENCODE_CREDENTIALS_DIR,
-            "OPENCODE_CREDENTIALS_PATH": sgate.OPENCODE_CREDENTIALS_PATH,
             "keychain_get": sgate.keychain_get,
+            "keychain_set": sgate.keychain_set,
+            "fetch_models": sgate.fetch_models,
             "chatgpt_is_running": sgate.chatgpt_is_running,
             "ccswitch_is_running": sgate.ccswitch_is_running,
         }
@@ -34,7 +36,6 @@ class SGateTests(unittest.TestCase):
         sgate.CHANNELS_PATH = root / "codex-channels.json"
         sgate.OPENCODE_CONFIG_PATH = root / "opencode.json"
         sgate.OPENCODE_CREDENTIALS_DIR = root / ".sgate"
-        sgate.OPENCODE_CREDENTIALS_PATH = sgate.OPENCODE_CREDENTIALS_DIR / "api-key"
         sgate.keychain_get = lambda slug: f"secret-for-{slug}"
         sgate.chatgpt_is_running = lambda: False
         sgate.ccswitch_is_running = lambda: False
@@ -146,10 +147,91 @@ class SGateTests(unittest.TestCase):
         self.assertEqual(config["agent"]["build"]["variant"], "xhigh")
         self.assertEqual(config["agent"]["build"]["model"], f"{provider_id}/model-2")
         provider = config["provider"][provider_id]
-        self.assertEqual(provider["options"]["apiKey"], "{file:" + str(sgate.OPENCODE_CREDENTIALS_PATH) + "}")
+        self.assertEqual(provider["options"]["apiKey"], "{file:" + str(sgate.opencode_credentials_path("test")) + "}")
         self.assertEqual(provider["models"]["model-2"]["variants"]["xhigh"]["reasoningEffort"], "xhigh")
-        self.assertEqual(sgate.OPENCODE_CREDENTIALS_PATH.read_text(encoding="utf-8").strip(), "secret-for-test")
+        self.assertEqual(sgate.opencode_credentials_path("test").read_text(encoding="utf-8").strip(), "secret-for-test")
         self.assertEqual(sgate.current_opencode_info()["reasoning_effort"], "xhigh")
+
+    def test_interactive_add_defers_tool_specific_choices(self) -> None:
+        args = type("Args", (), {
+            "name": "Deferred",
+            "slug": "deferred",
+            "base_url": "https://deferred.example/v1",
+            "model": None,
+            "reasoning": None,
+            "force": False,
+            "use": False,
+            "restart_app": False,
+        })()
+        with patch.object(sgate.getpass, "getpass", return_value="secret"), \
+                patch.object(sgate, "fetch_models", return_value=(["model-1", "model-2"], None)), \
+                patch.object(sgate, "keychain_set") as save_key:
+            sgate.add_channel(args, configure=False)
+        save_key.assert_called_once_with("deferred", "secret")
+        data = json.loads(sgate.CHANNELS_PATH.read_text(encoding="utf-8"))
+        channel = data["channels"]["deferred"]
+        self.assertEqual(channel["models"], ["model-1", "model-2"])
+        self.assertEqual(channel["selected_models"], [])
+        self.assertEqual(channel["selected_efforts"], [])
+        self.assertFalse(channel["enabled"])
+        self.assertFalse(channel["opencode_enabled"])
+
+    def test_updating_channel_preserves_opencode_selection(self) -> None:
+        data = json.loads(sgate.CHANNELS_PATH.read_text(encoding="utf-8"))
+        data["channels"]["test"].update({
+            "opencode_model": "oc-old",
+            "opencode_reasoning_effort": "low",
+            "opencode_selected_models": ["oc-old"],
+            "opencode_selected_efforts": ["low"],
+            "opencode_enabled": True,
+        })
+        sgate.save_channels(data)
+        args = type("Args", (), {
+            "name": "Updated",
+            "slug": "test",
+            "base_url": "https://updated.example/v1",
+            "model": None,
+            "reasoning": None,
+            "force": True,
+            "use": False,
+            "restart_app": False,
+        })()
+        with patch.object(sgate.getpass, "getpass", return_value="secret"), \
+                patch.object(sgate, "fetch_models", return_value=(["model-3"], None)), \
+                patch.object(sgate, "keychain_set"):
+            sgate.add_channel(args, configure=False)
+        updated = json.loads(sgate.CHANNELS_PATH.read_text(encoding="utf-8"))["channels"]["test"]
+        self.assertEqual(updated["opencode_model"], "oc-old")
+        self.assertEqual(updated["opencode_selected_models"], ["oc-old"])
+        self.assertTrue(updated["opencode_enabled"])
+
+    def test_codex_picker_does_not_require_opencode_config(self) -> None:
+        sgate.OPENCODE_CONFIG_PATH.write_text("not-json", encoding="utf-8")
+        with patch.object(sgate, "terminal_menu", return_value=None):
+            self.assertIsNone(sgate.choose_channel("Codex", runtime="codex"))
+
+    def test_opencode_refresh_keeps_codex_selection_separate(self) -> None:
+        data = json.loads(sgate.CHANNELS_PATH.read_text(encoding="utf-8"))
+        data["channels"]["test"].update({
+            "model": "codex-model",
+            "selected_models": ["codex-model"],
+            "reasoning_effort": "high",
+            "selected_efforts": ["high"],
+            "opencode_model": "open-model",
+            "opencode_selected_models": ["open-model"],
+            "opencode_reasoning_effort": "low",
+            "opencode_selected_efforts": ["low"],
+        })
+        sgate.save_channels(data)
+        with patch.object(sgate, "keychain_get", return_value="secret"), \
+                patch.object(sgate, "fetch_models", return_value=(["open-model", "open-model-2"], None)), \
+                patch.object(sgate, "choose_models", return_value=(["open-model-2"], "open-model-2")):
+            sgate.refresh_models("test", runtime="opencode")
+        updated = json.loads(sgate.CHANNELS_PATH.read_text(encoding="utf-8"))["channels"]["test"]
+        self.assertEqual(updated["selected_models"], ["codex-model"])
+        self.assertEqual(updated["model"], "codex-model")
+        self.assertEqual(updated["opencode_selected_models"], ["open-model-2"])
+        self.assertEqual(updated["opencode_model"], "open-model-2")
 
 
 if __name__ == "__main__":
