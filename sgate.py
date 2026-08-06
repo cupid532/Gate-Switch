@@ -1,0 +1,1744 @@
+#!/usr/bin/env python3
+"""SGate: interactive global Codex channel switcher for macOS.
+
+- API keys live in macOS Keychain, never in config.toml or shell arguments.
+- config.toml keeps the active provider/model/reasoning settings used by both
+  the standalone Codex CLI and the Codex binary bundled with ChatGPT.app.
+"""
+from __future__ import annotations
+
+import argparse
+import getpass
+import json
+import os
+import re
+import select
+import shutil
+import sqlite3
+import subprocess
+import sys
+import termios
+import textwrap
+import time
+import tty
+try:
+    import tomllib  # Python 3.11+
+except ModuleNotFoundError:  # macOS systems that still ship Python 3.8/3.9
+    tomllib = None
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser()
+CONFIG_PATH = CODEX_HOME / "config.toml"
+CHANNELS_PATH = CODEX_HOME / "codex-channels.json"
+# Keep the legacy service name so upgrades retain existing Keychain secrets.
+KEYCHAIN_PREFIX = "codex-channel"
+SCRIPT_PATH = Path(__file__).resolve()
+CHATGPT_CODEX = Path("/Applications/ChatGPT.app/Contents/Resources/codex")
+CCSWITCH_DB = Path.home() / ".cc-switch" / "cc-switch.db"
+DEFAULT_MODEL = "gpt-5.6"
+DEFAULT_EFFORT = "high"
+EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
+_KEY_PUSHBACK: dict[int, list[bytes]] = {}
+
+
+def die(message: str, code: int = 1) -> None:
+    print(f"错误：{message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def now_stamp() -> str:
+    return datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+
+
+def keychain_account() -> str:
+    return os.environ.get("USER") or getpass.getuser()
+
+
+def keychain_service(slug: str) -> str:
+    return f"{KEYCHAIN_PREFIX}:{slug}"
+
+
+def run_checked(argv: list[str], *, capture: bool = True) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(argv, text=True, capture_output=capture, check=True)
+    except FileNotFoundError:
+        die(f"找不到命令：{argv[0]}")
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or "").strip()
+        die(detail or f"命令执行失败：{' '.join(argv)}")
+
+
+def keychain_set(slug: str, value: str) -> None:
+    if sys.platform != "darwin":
+        die("此脚本使用 macOS Keychain，只支持 macOS。")
+    run_checked([
+        "security", "add-generic-password", "-a", keychain_account(),
+        "-s", keychain_service(slug), "-w", value, "-U",
+    ])
+
+
+def keychain_get(slug: str) -> str:
+    if sys.platform != "darwin":
+        die("此脚本使用 macOS Keychain，只支持 macOS。")
+    try:
+        proc = subprocess.run(
+            ["security", "find-generic-password", "-a", keychain_account(),
+             "-s", keychain_service(slug), "-w"],
+            text=True, capture_output=True, check=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        die(f"Keychain 中没有渠道 {slug!r} 的 API Key，请先执行 add。")
+    value = proc.stdout.strip()
+    if not value:
+        die(f"渠道 {slug!r} 的 API Key 为空。")
+    return value
+
+
+def keychain_delete(slug: str) -> None:
+    if sys.platform != "darwin":
+        return
+    subprocess.run(
+        ["security", "delete-generic-password", "-a", keychain_account(),
+         "-s", keychain_service(slug)],
+        text=True, capture_output=True,
+    )
+
+
+def slugify(value: str) -> str:
+    value = re.sub(r"[^a-z0-9_-]+", "-", value.strip().lower())
+    value = re.sub(r"-+", "-", value).strip("-_")
+    if not value:
+        die("渠道名称必须包含字母、数字、下划线或短横线。")
+    if value[0].isdigit():
+        value = f"c-{value}"
+    return value[:48]
+
+
+def terminal_ui_available() -> bool:
+    return bool(sys.stdin.isatty() and sys.stdout.isatty() and os.environ.get("TERM", "") != "dumb")
+
+
+def _read_key_byte(fd: int) -> bytes:
+    pending = _KEY_PUSHBACK.get(fd)
+    if pending:
+        value = pending.pop(0)
+        if not pending:
+            _KEY_PUSHBACK.pop(fd, None)
+        return value
+    return os.read(fd, 1)
+
+
+def _push_key_byte(fd: int, value: bytes) -> None:
+    _KEY_PUSHBACK.setdefault(fd, []).insert(0, value)
+
+
+def _prepare_picker_input(fd: int, *, quiet_for: float = 0.18, max_wait: float = 0.50) -> None:
+    """Discard the key event that opened this screen, including delayed CR/LF tails.
+
+    Netcatty can deliver the Return used on the previous screen after the next
+    picker has already started. Waiting for a short *quiet window*, rather than
+    sleeping once and flushing once, prevents a single Return from confirming
+    several screens in succession.
+    """
+    _KEY_PUSHBACK.pop(fd, None)
+    deadline = time.monotonic() + max_wait
+    quiet_deadline = time.monotonic() + quiet_for
+    while True:
+        now = time.monotonic()
+        if now >= deadline:
+            break
+        timeout = min(deadline - now, quiet_deadline - now)
+        if timeout <= 0:
+            break
+        if not select.select([fd], [], [], timeout)[0]:
+            break
+        while select.select([fd], [], [], 0)[0]:
+            os.read(fd, 1024)
+        quiet_deadline = time.monotonic() + quiet_for
+    termios.tcflush(fd, termios.TCIFLUSH)
+
+
+def _consume_enter_tail(fd: int, first: bytes) -> None:
+    """Consume CRLF/LFCR generated by one Return without eating the next key."""
+    deadline = time.monotonic() + 0.10
+    while time.monotonic() < deadline:
+        timeout = deadline - time.monotonic()
+        if not select.select([fd], [], [], timeout)[0]:
+            return
+        following = os.read(fd, 1)
+        if following in (b"\r", b"\n"):
+            # A terminal may emit more than one newline byte for a single key.
+            continue
+        _push_key_byte(fd, following)
+        return
+
+
+def _raw_key(fd: int) -> str:
+    raw = _read_key_byte(fd)
+    if not raw:
+        return "eof"
+    if raw in (b"\r", b"\n"):
+        _consume_enter_tail(fd, raw)
+        return "enter"
+    if raw == b" ":
+        return "space"
+    if raw == b"\x03":
+        raise KeyboardInterrupt
+    if raw in (b"\x7f", b"\x08"):
+        return "backspace"
+    if raw == b"\x1b":
+        # Read exactly one escape sequence. Do not greedily consume the next
+        # Space/Enter when a user selects quickly after pressing an arrow key.
+        if not select.select([fd], [], [], 0.04)[0]:
+            return "escape"
+        first = _read_key_byte(fd)
+        if first not in (b"[", b"O"):
+            _push_key_byte(fd, first)
+            return "escape"
+        if not select.select([fd], [], [], 0.04)[0]:
+            return "escape"
+        second = _read_key_byte(fd)
+        tail = first + second
+        if second.isdigit():
+            while select.select([fd], [], [], 0.01)[0] and len(tail) < 6:
+                char = _read_key_byte(fd)
+                tail += char
+                if char == b"~":
+                    break
+        mapping = {
+            b"[A": "up", b"OA": "up", b"[B": "down", b"OB": "down",
+            b"[C": "right", b"OC": "right", b"[D": "left", b"OD": "left",
+            b"[5~": "pageup", b"[6~": "pagedown", b"[H": "home", b"[F": "end",
+        }
+        return mapping.get(tail, "escape")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return ""
+
+
+def _paint_picker(title: str, options: list[tuple[str, str]], cursor: int, selected: int | set[int] | None,
+                  *, help_text: str, query: str = "", radio: bool = True) -> None:
+    _, rows = shutil.get_terminal_size((100, 28))
+    title_lines = title.splitlines() or [title]
+    header_rows = len(title_lines) + (3 if query else 2) + 3
+    page_size = max(5, rows - header_rows)
+    start = max(0, min(cursor - page_size // 2, max(0, len(options) - page_size)))
+    end = min(len(options), start + page_size)
+    out = ["\033[2J\033[H"]
+    out.extend(f"  {line}" for line in title_lines)
+    out.append("")
+    if query:
+        out.extend((f"  搜索：{query}", ""))
+    if start > 0:
+        out.append("  ↑ 还有更多")
+    if not options:
+        out.append("    没有匹配项，请继续输入或按 Esc 清空搜索")
+    for index in range(start, end):
+        _, label = options[index]
+        if radio:
+            pointer = "❯" if index == cursor else " "
+            is_selected = index in selected if isinstance(selected, set) else index == selected
+            marker = "[x]" if is_selected else "[ ]"
+            line = f"  {pointer} {marker} {label}"
+        else:
+            line = f"    {label}"
+            if index == cursor:
+                line = f"\033[7m  ❯ {label}  \033[0m"
+        out.append(line)
+    if end < len(options):
+        out.append("  ↓ 还有更多")
+    out.extend(("", f"  {help_text}"))
+    # setraw() disables terminal newline translation on several terminal apps.
+    # Always emit CRLF explicitly so every menu row starts in column zero.
+    sys.stdout.write("\r\n".join(out))
+    sys.stdout.flush()
+
+
+def terminal_radio(title: str, options: list[tuple[str, str]], *, default: str | None = None,
+                   searchable: bool = False) -> str | None:
+    """Arrow-key radio picker. Space toggles, Enter confirms, Esc cancels."""
+    if not options:
+        return None
+    if not terminal_ui_available():
+        for i, (_, label) in enumerate(options, 1):
+            print(f"{i}) {label}")
+        raw = input("输入序号（回车取消）：").strip()
+        return options[int(raw) - 1][0] if raw.isdigit() and 1 <= int(raw) <= len(options) else None
+
+    all_options = options
+    filtered = options
+    selected_value = default if any(value == default for value, _ in options) else None
+    cursor = next((i for i, (value, _) in enumerate(filtered) if value == selected_value), 0)
+    query = ""
+    searching = False
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    sys.stdout.write("\033[?1049h\033[?25l")
+    sys.stdout.flush()
+    try:
+        tty.setcbreak(fd)
+        _prepare_picker_input(fd)
+        while True:
+            selected = next((i for i, (value, _) in enumerate(filtered) if value == selected_value), None)
+            help_text = (
+                "输入关键词筛选 · Backspace 删除 · Enter 完成筛选 · Esc 清空"
+                if searching else
+                "↑↓ 移动 · Space 选择/取消 · Enter 应用选择 · / 搜索 · Esc 返回"
+            )
+            _paint_picker(title, filtered, cursor, selected, help_text=help_text, query=query)
+            key = _raw_key(fd)
+            if searching:
+                if key == "enter":
+                    searching = False
+                elif key == "escape":
+                    query = ""
+                    filtered = all_options
+                    cursor = 0
+                    searching = False
+                elif key == "backspace":
+                    query = query[:-1]
+                elif len(key) == 1 and key.isprintable():
+                    query += key
+                filtered = [item for item in all_options if query.casefold() in item[1].casefold()]
+                if not filtered:
+                    filtered = all_options
+                    query = ""
+                cursor = min(cursor, len(filtered) - 1)
+                continue
+            if key in ("up", "k"):
+                cursor = (cursor - 1) % len(filtered)
+            elif key in ("down", "j"):
+                cursor = (cursor + 1) % len(filtered)
+            elif key == "pageup":
+                cursor = max(0, cursor - 10)
+            elif key == "pagedown":
+                cursor = min(len(filtered) - 1, cursor + 10)
+            elif key == "home":
+                cursor = 0
+            elif key == "end":
+                cursor = len(filtered) - 1
+            elif key == "space":
+                value = filtered[cursor][0]
+                selected_value = None if selected_value == value else value
+            elif key == "enter":
+                return selected_value
+            elif key == "/" and searchable:
+                query = ""
+                searching = True
+            elif key in ("escape", "q", "eof"):
+                return None
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        sys.stdout.write("\033[0m\033[?25h\033[?1049l")
+        sys.stdout.flush()
+
+
+def terminal_multi(
+    title: str,
+    options: list[tuple[str, str]],
+    *,
+    defaults: list[str] | tuple[str, ...] | set[str] | None = None,
+    default_value: str | None = None,
+    searchable: bool = False,
+) -> tuple[list[str], str] | None:
+    """Checkbox picker. Space toggles many; Enter sets cursor item as default."""
+    if not options:
+        return None
+    allowed = {value for value, _ in options}
+    selected_values = {value for value in (defaults or []) if value in allowed}
+    if default_value in allowed:
+        selected_values.add(str(default_value))
+
+    if not terminal_ui_available():
+        for i, (value, label) in enumerate(options, 1):
+            marker = "x" if value in selected_values else " "
+            print(f"{i}) [{marker}] {label}")
+        raw = input("输入多个序号（逗号分隔，回车保留当前）：").strip()
+        if raw:
+            indexes = []
+            for part in re.split(r"[,，\s]+", raw):
+                if part.isdigit() and 1 <= int(part) <= len(options):
+                    indexes.append(int(part) - 1)
+            selected_values = {options[index][0] for index in indexes}
+        if not selected_values:
+            return None
+        default = default_value if default_value in selected_values else next(
+            (value for value, _ in options if value in selected_values), None
+        )
+        return ([value for value, _ in options if value in selected_values], str(default))
+
+    all_options = options
+    filtered = options
+    cursor = next((i for i, (value, _) in enumerate(filtered) if value == default_value), 0)
+    query = ""
+    searching = False
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    sys.stdout.write("\033[?1049h\033[?25l")
+    sys.stdout.flush()
+    try:
+        tty.setcbreak(fd)
+        _prepare_picker_input(fd)
+        while True:
+            selected_indexes = {i for i, (value, _) in enumerate(filtered) if value in selected_values}
+            help_text = (
+                "输入关键词筛选 · Backspace 删除 · Enter 完成筛选 · Esc 清空"
+                if searching else
+                "↑↓ 移动 · Space 勾选/取消多个 · Enter 将光标项设为默认并继续 · / 搜索 · Esc 返回"
+            )
+            _paint_picker(title, filtered, cursor, selected_indexes, help_text=help_text, query=query)
+            key = _raw_key(fd)
+            if searching:
+                if key == "enter":
+                    searching = False
+                elif key == "escape":
+                    query = ""
+                    filtered = all_options
+                    cursor = 0
+                    searching = False
+                elif key == "backspace":
+                    query = query[:-1]
+                elif len(key) == 1 and key.isprintable():
+                    query += key
+                filtered = [item for item in all_options if query.casefold() in item[1].casefold()]
+                if not filtered:
+                    filtered = all_options
+                    query = ""
+                cursor = min(cursor, len(filtered) - 1)
+                continue
+            if key in ("up", "k"):
+                cursor = (cursor - 1) % len(filtered)
+            elif key in ("down", "j"):
+                cursor = (cursor + 1) % len(filtered)
+            elif key == "pageup":
+                cursor = max(0, cursor - 10)
+            elif key == "pagedown":
+                cursor = min(len(filtered) - 1, cursor + 10)
+            elif key == "home":
+                cursor = 0
+            elif key == "end":
+                cursor = len(filtered) - 1
+            elif key == "space":
+                value = filtered[cursor][0]
+                if value in selected_values:
+                    selected_values.remove(value)
+                else:
+                    selected_values.add(value)
+            elif key == "enter":
+                default = filtered[cursor][0]
+                selected_values.add(default)
+                selected = [value for value, _ in all_options if value in selected_values]
+                return selected, default
+            elif key == "/" and searchable:
+                query = ""
+                searching = True
+            elif key in ("escape", "q", "eof"):
+                return None
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        sys.stdout.write("\033[0m\033[?25h\033[?1049l")
+        sys.stdout.flush()
+
+
+def terminal_menu(title: str, options: list[tuple[str, str]], *, default: str | None = None) -> str | None:
+    """Menu variant: moving the cursor and pressing Enter immediately chooses an action."""
+    if not options:
+        return None
+    if not terminal_ui_available():
+        for i, (_, label) in enumerate(options, 1):
+            print(f"{i}) {label}")
+        raw = input("请选择（回车取消）：").strip()
+        return options[int(raw) - 1][0] if raw.isdigit() and 1 <= int(raw) <= len(options) else None
+    cursor = next((i for i, (value, _) in enumerate(options) if value == default), 0)
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    sys.stdout.write("\033[?1049h\033[?25l")
+    sys.stdout.flush()
+    try:
+        tty.setcbreak(fd)
+        _prepare_picker_input(fd)
+        while True:
+            _paint_picker(title, options, cursor, None, help_text="↑↓ 移动 · Enter 确认 · Esc 返回", radio=False)
+            key = _raw_key(fd)
+            if key in ("up", "k"):
+                cursor = (cursor - 1) % len(options)
+            elif key in ("down", "j"):
+                cursor = (cursor + 1) % len(options)
+            elif key == "home":
+                cursor = 0
+            elif key == "end":
+                cursor = len(options) - 1
+            elif key == "enter":
+                return options[cursor][0]
+            elif key in ("escape", "q", "eof"):
+                return None
+            elif key.isdigit() and key != "0":
+                index = int(key) - 1
+                if 0 <= index < len(options):
+                    return options[index][0]
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        sys.stdout.write("\033[0m\033[?25h\033[?1049l")
+        sys.stdout.flush()
+
+
+def confirm_action(message: str, *, default: bool = False) -> bool:
+    if terminal_ui_available():
+        picked = terminal_menu(message, [("no", "取消"), ("yes", "确定")], default="yes" if default else "no")
+        return picked == "yes"
+    suffix = "[Y/n]" if default else "[y/N]"
+    answer = input(f"{message} {suffix} ").strip().lower()
+    return default if not answer else answer in ("y", "yes")
+
+
+def pause_after_action() -> None:
+    if terminal_ui_available():
+        try:
+            input("\n按 Enter 返回菜单……")
+        except (KeyboardInterrupt, EOFError):
+            pass
+
+
+def load_channels() -> dict[str, Any]:
+    if not CHANNELS_PATH.exists():
+        return {"version": 1, "active": None, "channels": {}}
+    try:
+        data = json.loads(CHANNELS_PATH.read_text(encoding="utf-8"))
+    except Exception as exc:
+        die(f"无法读取 {CHANNELS_PATH}：{exc}")
+    if not isinstance(data, dict) or not isinstance(data.get("channels", {}), dict):
+        die(f"渠道文件格式损坏：{CHANNELS_PATH}")
+    return data
+
+
+def save_channels(data: dict[str, Any]) -> None:
+    data["version"] = max(2, int(data.get("version", 1) or 1))
+    CODEX_HOME.mkdir(parents=True, exist_ok=True)
+    tmp = CHANNELS_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, CHANNELS_PATH)
+    os.chmod(CHANNELS_PATH, 0o600)
+
+
+def toml_string(value: str) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
+def read_config() -> str:
+    if not CONFIG_PATH.exists():
+        die(f"找不到 Codex 配置文件：{CONFIG_PATH}")
+    return CONFIG_PATH.read_text(encoding="utf-8")
+
+
+def _fallback_toml_string(value: str) -> str:
+    value = value.strip()
+    if value.startswith('"') and value.endswith('"'):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return value[1:-1]
+    return value
+
+
+def parse_config() -> dict[str, Any]:
+    content = read_config()
+    if tomllib is not None:
+        try:
+            return tomllib.loads(content)
+        except Exception as exc:
+            die(f"config.toml 解析失败：{exc}")
+
+    # Minimal read-only fallback for Python 3.8/3.9. The script only needs
+    # the active provider, model, reasoning, and provider name/base_url.
+    result: dict[str, Any] = {}
+    for key in ("model_provider", "model", "model_reasoning_effort", "model_catalog_json"):
+        match = re.search(rf"(?m)^{re.escape(key)}\s*=\s*(.+)$", content)
+        if match:
+            result[key] = _fallback_toml_string(match.group(1))
+    providers: dict[str, dict[str, Any]] = {}
+    table_re = re.compile(r"(?ms)^\[model_providers\.([A-Za-z0-9_-]+)\]\s*$\n(.*?)(?=^\[|\Z)")
+    for match in table_re.finditer(content):
+        provider: dict[str, Any] = {}
+        for key in ("name", "base_url", "wire_api"):
+            value_match = re.search(rf"(?m)^{re.escape(key)}\s*=\s*(.+)$", match.group(2))
+            if value_match:
+                provider[key] = _fallback_toml_string(value_match.group(1))
+        providers[match.group(1)] = provider
+    result["model_providers"] = providers
+    return result
+
+
+def current_config_info() -> dict[str, Any]:
+    cfg = parse_config()
+    provider_id = str(cfg.get("model_provider", "openai"))
+    providers = cfg.get("model_providers", {})
+    provider = providers.get(provider_id, {}) if isinstance(providers, dict) else {}
+    return {
+        "provider_id": provider_id,
+        "provider": provider if isinstance(provider, dict) else {},
+        "model": str(cfg.get("model", "(未设置)")),
+        "reasoning_effort": str(cfg.get("model_reasoning_effort", "(未设置)")),
+        "model_catalog_json": str(cfg.get("model_catalog_json", "(未设置)")),
+    }
+
+
+def ccswitch_current_info() -> dict[str, Any] | None:
+    """Read only CC Switch's current Codex profile, without reading its API key."""
+    if not CCSWITCH_DB.exists():
+        return None
+    try:
+        db = sqlite3.connect(f"file:{CCSWITCH_DB}?mode=ro", uri=True, timeout=1)
+        row = db.execute(
+            "select name, settings_config from providers "
+            "where app_type='codex' and is_current=1 limit 1"
+        ).fetchone()
+        db.close()
+    except (sqlite3.Error, OSError, ValueError):
+        return None
+    if not row:
+        return None
+    name, raw_settings = row
+    try:
+        settings = json.loads(raw_settings or "{}")
+    except json.JSONDecodeError:
+        settings = {}
+    content = settings.get("config", "") if isinstance(settings, dict) else ""
+    if not isinstance(content, str):
+        content = ""
+
+    def assignment(key: str, default: str = "(未设置)") -> str:
+        match = re.search(rf"(?m)^{re.escape(key)}\s*=\s*(.+)$", content)
+        return _fallback_toml_string(match.group(1)) if match else default
+
+    base_match = re.search(r"(?m)^base_url\s*=\s*(.+)$", content)
+    return {
+        "name": str(name),
+        "provider_id": assignment("model_provider"),
+        "model": assignment("model"),
+        "base_url": _fallback_toml_string(base_match.group(1)) if base_match else "(未设置)",
+    }
+
+
+def update_top_level(content: str, values: dict[str, str]) -> str:
+    """Update assignments before the first TOML table and preserve everything else."""
+    lines = content.splitlines(keepends=True)
+    first_table = next((i for i, line in enumerate(lines) if re.match(r"^\s*\[", line)), len(lines))
+    prefix, suffix = lines[:first_table], lines[first_table:]
+    found: set[str] = set()
+    for i, line in enumerate(prefix):
+        for key, value in values.items():
+            if re.match(rf"^\s*{re.escape(key)}\s*=", line):
+                ending = "\n" if line.endswith("\n") else ""
+                prefix[i] = f"{key} = {toml_string(value)}{ending}"
+                found.add(key)
+                break
+    missing = [f"{key} = {toml_string(value)}\n" for key, value in values.items() if key not in found]
+    if missing:
+        if prefix and not prefix[-1].endswith("\n"):
+            prefix[-1] += "\n"
+        prefix.extend(missing)
+    return "".join(prefix + suffix)
+
+
+def provider_id(slug: str) -> str:
+    return f"codex_channel_{slug.replace('-', '_')}"
+
+
+def provider_block(channel: dict[str, Any]) -> str:
+    slug = channel["slug"]
+    pid = provider_id(slug)
+    return textwrap.dedent(f"""\
+        # >>> codex-channel managed provider: {slug}
+        [model_providers.{pid}]
+        name = {toml_string(channel['name'])}
+        base_url = {toml_string(channel['base_url'])}
+        wire_api = "responses"
+        request_max_retries = 4
+        stream_max_retries = 5
+
+        [model_providers.{pid}.auth]
+        command = {toml_string(str(SCRIPT_PATH))}
+        args = ["token", {toml_string(slug)}]
+        timeout_ms = 5000
+        # <<< codex-channel managed provider: {slug}
+        """)
+
+
+def update_provider_block(content: str, channel: dict[str, Any]) -> str:
+    slug = channel["slug"]
+    block = provider_block(channel).rstrip() + "\n"
+    marker = re.compile(
+        rf"(?ms)^# >>> codex-channel managed provider: {re.escape(slug)}\n.*?^# <<< codex-channel managed provider: {re.escape(slug)}\n?"
+    )
+    if marker.search(content):
+        return marker.sub(block, content, count=1)
+    if content and not content.endswith("\n"):
+        content += "\n"
+    return content + "\n" + block
+
+
+def backup_config() -> Path | None:
+    if not CONFIG_PATH.exists():
+        return None
+    backup = CONFIG_PATH.with_name(f"config.toml.sgate-{now_stamp()}.bak")
+    shutil.copy2(CONFIG_PATH, backup)
+    return backup
+
+
+def write_config(content: str) -> None:
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = CONFIG_PATH.with_suffix(".tmp")
+    tmp.write_text(content, encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, CONFIG_PATH)
+    os.chmod(CONFIG_PATH, 0o600)
+
+
+def models_url(base_url: str) -> str:
+    base = base_url.rstrip("/")
+    for suffix in ("/responses", "/chat/completions", "/models"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+    return base + "/models"
+
+
+def fetch_models(base_url: str, api_key: str) -> tuple[list[str], str | None]:
+    url = models_url(base_url)
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Accept": "application/json",
+            "User-Agent": "sgate/3.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            raw = response.read(8_000_000)
+            if response.status < 200 or response.status >= 300:
+                return [], f"HTTP {response.status}"
+    except urllib.error.HTTPError as exc:
+        body = exc.read(1000).decode("utf-8", "replace").replace("\n", " ")
+        return [], f"HTTP {exc.code}: {body[:300]}"
+    except urllib.error.URLError as exc:
+        return [], f"网络错误：{exc.reason}"
+    except TimeoutError:
+        return [], "请求超时"
+    try:
+        obj = json.loads(raw)
+    except json.JSONDecodeError:
+        return [], "返回内容不是 JSON"
+
+    if isinstance(obj, list):
+        items = obj
+    elif isinstance(obj, dict):
+        items = obj.get("data") or obj.get("models") or obj.get("items") or []
+    else:
+        items = []
+    names: list[str] = []
+    for item in items if isinstance(items, list) else []:
+        if isinstance(item, str):
+            name = item
+        elif isinstance(item, dict):
+            name = item.get("id") or item.get("model") or item.get("name")
+        else:
+            name = None
+        if isinstance(name, str) and name.strip() and name.strip() not in names:
+            names.append(name.strip())
+    return sorted(names, key=str.casefold), None
+
+
+def _model_sort_key(name: str, default: str | None) -> tuple[Any, ...]:
+    lower = name.casefold()
+    incompatible = any(token in lower for token in (
+        "image", "dall-e", "embedding", "whisper", "tts", "audio", "moderation", "realtime",
+    ))
+    preferred = "codex" in lower or lower.startswith("gpt-5")
+    numbers = tuple(-int(part) for part in re.findall(r"\d+", lower)[:4])
+    return (name != default, incompatible, not preferred, numbers, lower)
+
+
+def _model_label(name: str, default: str | None) -> str:
+    lower = name.casefold()
+    notes: list[str] = []
+    if name == default:
+        notes.append("当前")
+    if any(token in lower for token in ("image", "dall-e", "embedding", "whisper", "tts", "audio", "moderation")):
+        notes.append("通常不适合 Codex")
+    elif "codex" in lower or lower.startswith("gpt-5"):
+        notes.append("适合代码任务")
+    return f"{name}  [{' · '.join(notes)}]" if notes else name
+
+
+def choose_model(models: list[str], default: str | None = None) -> str | None:
+    picked = choose_models(models, defaults=[default] if default else None, default_value=default)
+    return picked[1] if picked else None
+
+
+def choose_models(
+    models: list[str],
+    *,
+    defaults: list[str] | None = None,
+    default_value: str | None = None,
+) -> tuple[list[str], str] | None:
+    if not models:
+        manual = input(f"未拉取到模型，请手动输入模型名 [{default_value or DEFAULT_MODEL}]（回车取消）：").strip()
+        model = manual or (default_value if default_value else None)
+        return ([model], model) if model else None
+    ordered = sorted(dict.fromkeys(models), key=lambda name: _model_sort_key(name, default_value))
+    options = [(name, _model_label(name, default_value)) for name in ordered]
+    print(f"\n已自动拉取 {len(ordered)} 个可用模型。")
+    return terminal_multi(
+        "选择可在 ChatGPT.app 中切换的模型\n  可勾选多个；按 Enter 时光标项成为默认模型",
+        options,
+        defaults=defaults,
+        default_value=default_value,
+        searchable=True,
+    )
+
+
+def _effort_labels() -> dict[str, str]:
+    return {
+        "minimal": "minimal  · 最低，速度优先",
+        "low": "low      · 较低",
+        "medium": "medium   · 平衡",
+        "high": "high     · 较高",
+        "xhigh": "xhigh    · 最高，质量优先",
+    }
+
+
+def choose_effort(default: str | None = None) -> str | None:
+    picked = choose_efforts(defaults=[default] if default else None, default_value=default)
+    return picked[1] if picked else None
+
+
+def choose_efforts(
+    *,
+    defaults: list[str] | None = None,
+    default_value: str | None = None,
+) -> tuple[list[str], str] | None:
+    labels = _effort_labels()
+    current = default_value if default_value in EFFORTS else DEFAULT_EFFORT
+    return terminal_multi(
+        "选择可在 ChatGPT.app 中切换的推理强度\n  可勾选多个；按 Enter 时光标项成为默认强度",
+        [(effort, labels[effort] + ("  [当前默认]" if effort == current else "")) for effort in EFFORTS],
+        defaults=defaults,
+        default_value=current,
+    )
+
+
+def channel_catalog_path() -> Path:
+    return CODEX_HOME / "sgate-model-catalog.json"
+
+
+def _read_catalog_entries(path: Path) -> list[dict[str, Any]]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return []
+    entries = raw.get("models", []) if isinstance(raw, dict) else raw
+    return [entry for entry in entries if isinstance(entry, dict) and entry.get("slug")] if isinstance(entries, list) else []
+
+
+def _model_template_map() -> dict[str, dict[str, Any]]:
+    templates: dict[str, dict[str, Any]] = {}
+    for path in (CODEX_HOME / "models_cache.json", CODEX_HOME / "cc-switch-model-catalog.json"):
+        for entry in _read_catalog_entries(path):
+            templates.setdefault(str(entry["slug"]), entry)
+    return templates
+
+
+def _minimal_catalog_entry(model: str) -> dict[str, Any]:
+    return {
+        "slug": model,
+        "display_name": model,
+        "description": model,
+        "default_reasoning_level": DEFAULT_EFFORT,
+        "supported_reasoning_levels": [],
+        "shell_type": "shell_command",
+        "visibility": "list",
+        "supported_in_api": True,
+        "priority": 1000,
+        "additional_speed_tiers": [],
+        "service_tiers": [],
+        "availability_nux": None,
+        "upgrade": None,
+        "base_instructions": "You are Codex, a coding agent. You and the user share the same workspace and collaborate to achieve the user's goals.",
+        "context_window": 128000,
+        "max_context_window": 128000,
+        "effective_context_window_percent": 95,
+        "input_modalities": ["text", "image"],
+        "supports_reasoning_summaries": True,
+        "default_reasoning_summary": "none",
+        "supports_parallel_tool_calls": True,
+        "supports_search_tool": False,
+        "support_verbosity": False,
+        "experimental_supported_tools": [],
+        "truncation_policy": {"mode": "bytes", "limit": 10000},
+    }
+
+
+def _normalized_values(values: Any, allowed: list[str] | tuple[str, ...] | None = None) -> list[str]:
+    source = values if isinstance(values, list) else []
+    result: list[str] = []
+    for value in source:
+        text = str(value).strip()
+        if text and text not in result and (allowed is None or text in allowed):
+            result.append(text)
+    return result
+
+
+def write_model_catalog(channel: dict[str, Any]) -> Path:
+    models = _normalized_values(channel.get("selected_models"))
+    default_model = str(channel.get("model") or DEFAULT_MODEL)
+    if default_model not in models:
+        models.append(default_model)
+    models = [default_model, *[name for name in models if name != default_model]]
+    efforts = _normalized_values(channel.get("selected_efforts"), EFFORTS)
+    default_effort = str(channel.get("reasoning_effort") or DEFAULT_EFFORT)
+    if default_effort not in EFFORTS:
+        default_effort = DEFAULT_EFFORT
+    if default_effort not in efforts:
+        efforts.append(default_effort)
+    if not efforts:
+        efforts = [DEFAULT_EFFORT]
+
+    descriptions = {
+        "minimal": "Minimal reasoning for fastest responses",
+        "low": "Fast responses with lighter reasoning",
+        "medium": "Balances speed and reasoning depth",
+        "high": "Greater reasoning depth for complex problems",
+        "xhigh": "Extra high reasoning depth for complex problems",
+    }
+    templates = _model_template_map()
+    entries: list[dict[str, Any]] = []
+    for priority, model in enumerate(models):
+        template = templates.get(model)
+        entry = json.loads(json.dumps(template, ensure_ascii=False)) if template else _minimal_catalog_entry(model)
+        known_descriptions = {
+            str(level.get("effort")): str(level.get("description") or descriptions.get(str(level.get("effort")), ""))
+            for level in entry.get("supported_reasoning_levels", []) if isinstance(level, dict)
+        }
+        entry.update({
+            "slug": model,
+            "display_name": entry.get("display_name") or model,
+            "description": entry.get("description") or model,
+            "default_reasoning_level": default_effort,
+            "supported_reasoning_levels": [
+                {"effort": effort, "description": known_descriptions.get(effort) or descriptions[effort]}
+                for effort in efforts
+            ],
+            "visibility": "list",
+            "supported_in_api": True,
+            "priority": priority,
+        })
+        entries.append(entry)
+
+    path = channel_catalog_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"models": entries}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+    os.chmod(path, 0o600)
+    return path
+
+
+def _managed_provider_ids(data: dict[str, Any]) -> set[str]:
+    return {provider_id(slug) for slug in data.get("channels", {})}
+
+
+def _settings_from_content(content: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for key in ("model_provider", "model", "model_reasoning_effort", "model_catalog_json"):
+        match = re.search(rf"(?m)^{re.escape(key)}\s*=\s*(.+)$", content)
+        if match:
+            values[key] = _fallback_toml_string(match.group(1))
+    return values
+
+
+def _discover_previous_config(data: dict[str, Any]) -> dict[str, str] | None:
+    """Find the newest pre-switch backup whose provider is not managed here."""
+    managed = _managed_provider_ids(data)
+    backups = sorted(
+        [*CONFIG_PATH.parent.glob("config.toml.sgate-*.bak"), *CONFIG_PATH.parent.glob("config.toml.codex-channel-*.bak")],
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for path in backups:
+        try:
+            values = _settings_from_content(path.read_text(encoding="utf-8"))
+        except OSError:
+            continue
+        candidate = values.get("model_provider")
+        if candidate and candidate not in managed:
+            return {
+                "model_provider": candidate,
+                "model": values.get("model", DEFAULT_MODEL),
+                "model_reasoning_effort": values.get("model_reasoning_effort", DEFAULT_EFFORT),
+                "model_catalog_json": values.get("model_catalog_json", "models_cache.json"),
+            }
+    return None
+
+
+def _remember_fallback(data: dict[str, Any], info: dict[str, Any]) -> None:
+    """Remember the config that should return after a managed channel is disabled."""
+    values: dict[str, Any] | None = None
+    if info["provider_id"] not in _managed_provider_ids(data):
+        values = {
+            "model_provider": info["provider_id"],
+            "model": info["model"],
+            "model_reasoning_effort": info["reasoning_effort"],
+            "model_catalog_json": info.get("model_catalog_json", "models_cache.json"),
+        }
+    elif not isinstance(data.get("fallback"), dict):
+        # Upgrade path from version 1: recover the provider that existed before
+        # SGate (formerly codex-channel) first overwrote the top-level settings.
+        values = _discover_previous_config(data)
+    elif not data.get("fallback", {}).get("model_catalog_json"):
+        previous = _discover_previous_config(data)
+        if previous and previous.get("model_catalog_json"):
+            data["fallback"]["model_catalog_json"] = previous["model_catalog_json"]
+    if values:
+        data["fallback"] = {
+            **values,
+            "saved_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+
+def _valid_setting(value: Any, fallback: str) -> str:
+    text = str(value or "").strip()
+    return fallback if not text or text == "(未设置)" else text
+
+
+def select_channel(
+    slug: str,
+    *,
+    model: str | None = None,
+    effort: str | None = None,
+    selected_models: list[str] | None = None,
+    selected_efforts: list[str] | None = None,
+    restart_app: bool = False,
+) -> None:
+    data = load_channels()
+    channel = data.get("channels", {}).get(slug)
+    if not channel:
+        die(f"渠道不存在：{slug}。先执行 list 或 add。")
+    effort = effort or channel.get("reasoning_effort") or DEFAULT_EFFORT
+    if effort not in EFFORTS:
+        die(f"推理强度必须是：{', '.join(EFFORTS)}")
+    model = model or channel.get("model") or DEFAULT_MODEL
+
+    available_models = _normalized_values(channel.get("models"))
+    chosen_models = _normalized_values(selected_models) if selected_models is not None else _normalized_values(channel.get("selected_models"))
+    if not chosen_models:
+        chosen_models = [name for name in available_models if not any(
+            token in name.casefold() for token in ("image", "dall-e", "embedding", "whisper", "tts", "audio", "moderation")
+        )]
+    if model not in chosen_models:
+        chosen_models.append(model)
+    chosen_efforts = _normalized_values(selected_efforts, EFFORTS) if selected_efforts is not None else _normalized_values(channel.get("selected_efforts"), EFFORTS)
+    if not chosen_efforts:
+        chosen_efforts = list(EFFORTS)
+    if effort not in chosen_efforts:
+        chosen_efforts.append(effort)
+
+    current = current_config_info()
+    _remember_fallback(data, current)
+    for item in data.get("channels", {}).values():
+        item["enabled"] = False
+    channel["model"] = model
+    channel["reasoning_effort"] = effort
+    channel["selected_models"] = chosen_models
+    channel["selected_efforts"] = chosen_efforts
+    channel["enabled"] = True
+    channel["last_enabled_at"] = datetime.now(timezone.utc).isoformat()
+    data["active"] = slug
+    catalog = write_model_catalog(channel)
+    save_channels(data)
+
+    content = update_provider_block(read_config(), channel)
+    content = update_top_level(content, {
+        "model_provider": provider_id(slug),
+        "model": model,
+        "model_reasoning_effort": effort,
+        "model_catalog_json": str(catalog),
+    })
+    backup = backup_config()
+    write_config(content)
+    if backup:
+        print(f"已备份配置：{backup}")
+    print(f"已启用：{channel['name']} ({slug})")
+    print(f"  Base URL：{channel['base_url']}\n  默认 Model：{model}\n  默认 Reasoning：{effort}")
+    print(f"  可切换模型：{len(chosen_models)} 个 · 可切换推理强度：{len(chosen_efforts)} 个")
+    print(f"  模型目录：{catalog}\n  实际配置：{CONFIG_PATH}")
+    if ccswitch_is_running():
+        print("  注意：检测到 CC Switch 正在运行；以后在 CC Switch 中切换渠道可能再次覆盖本文件。")
+    if chatgpt_is_running():
+        if restart_app:
+            restart_chatgpt(ask=False)
+        else:
+            print("  注意：ChatGPT.app 当前正在运行；需要重启 App 才能读取新配置。")
+    else:
+        print("  ChatGPT.app 当前未运行；下次启动时将使用此渠道。")
+
+
+def deactivate_channel(*, restart_app: bool = False) -> None:
+    """Disable the managed channel without deleting its record or Keychain secret."""
+    data = load_channels()
+    info = current_config_info()
+    current_slug = next(
+        (slug for slug in data.get("channels", {}) if provider_id(slug) == info["provider_id"]),
+        data.get("active"),
+    )
+    _remember_fallback(data, info)
+    fallback = data.get("fallback") if isinstance(data.get("fallback"), dict) else {}
+    fallback_provider = _valid_setting(fallback.get("model_provider"), "openai")
+    if fallback_provider in _managed_provider_ids(data):
+        fallback_provider = "openai"
+    fallback_model = _valid_setting(fallback.get("model"), _valid_setting(info.get("model"), DEFAULT_MODEL))
+    fallback_effort = _valid_setting(fallback.get("model_reasoning_effort"), DEFAULT_EFFORT)
+    if fallback_effort not in EFFORTS:
+        fallback_effort = DEFAULT_EFFORT
+
+    fallback_catalog = _valid_setting(fallback.get("model_catalog_json"), "models_cache.json")
+    values = {
+        "model_provider": fallback_provider,
+        "model": fallback_model,
+        "model_reasoning_effort": fallback_effort,
+        "model_catalog_json": fallback_catalog,
+    }
+    backup = backup_config()
+    write_config(update_top_level(read_config(), values))
+    for item in data.get("channels", {}).values():
+        item["enabled"] = False
+    if current_slug in data.get("channels", {}):
+        data["channels"][current_slug]["last_disabled_at"] = datetime.now(timezone.utc).isoformat()
+    data["active"] = None
+    save_channels(data)
+    if backup:
+        print(f"已备份配置：{backup}")
+    if current_slug:
+        print(f"已取消启用渠道：{current_slug}（渠道和 API Key 都已保留，可随时再次启用）。")
+    else:
+        print("当前没有启用由本脚本管理的渠道；已恢复备用配置。")
+    print(f"  替代 provider：{fallback_provider}\n  Model：{fallback_model}\n  Reasoning：{fallback_effort}\n  Model catalog：{fallback_catalog}")
+    print("  已运行的会话不会热切换；下次打开或重启 ChatGPT.app 后使用替代配置。")
+    if restart_app and chatgpt_is_running():
+        restart_chatgpt(ask=False)
+
+
+def switch_login(model: str | None = None, effort: str | None = None) -> None:
+    if effort is not None and effort not in EFFORTS:
+        die(f"推理强度必须是：{', '.join(EFFORTS)}")
+    info = current_config_info()
+    selected_effort = effort or _valid_setting(info.get("reasoning_effort"), DEFAULT_EFFORT)
+    if selected_effort not in EFFORTS:
+        selected_effort = DEFAULT_EFFORT
+    values = {
+        "model_provider": "openai",
+        "model": model or _valid_setting(info.get("model"), DEFAULT_MODEL),
+        "model_reasoning_effort": selected_effort,
+    }
+    backup = backup_config()
+    write_config(update_top_level(read_config(), values))
+    data = load_channels()
+    for item in data.get("channels", {}).values():
+        item["enabled"] = False
+    data["active"] = None
+    data["fallback"] = {
+        **values,
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+    }
+    save_channels(data)
+    if backup:
+        print(f"已备份配置：{backup}")
+    print("已切换到官方登录渠道；没有删除 auth.json，也没有删除任何已保存渠道。")
+    print(f"  Model：{values['model']}\n  Reasoning：{values['model_reasoning_effort']}")
+    print("注意：已经运行的 ChatGPT/Codex 会话不会热加载配置；重启 ChatGPT 后生效。")
+
+
+def add_channel(args: argparse.Namespace) -> None:
+    data = load_channels()
+    name = args.name or input("渠道名称（如：公司网关）：").strip()
+    if not name:
+        die("渠道名称不能为空。")
+    slug = slugify(args.slug or name)
+    base_url = (args.base_url or input("Base URL（例如 https://api.example.com/v1）：").strip()).rstrip("/")
+    if not re.match(r"^https?://", base_url, re.I):
+        die("Base URL 必须以 http:// 或 https:// 开头。")
+
+    api_key = getpass.getpass("API Key（不会回显，保存到 macOS Keychain）：").strip()
+    if not api_key:
+        die("API Key 不能为空。")
+    print(f"正在从 {models_url(base_url)} 自动拉取模型列表……")
+    models, error = fetch_models(base_url, api_key)
+    if error:
+        print(f"模型自动拉取失败：{error}")
+        if not confirm_action("模型拉取失败，仍然手动输入模型名？"):
+            print("已取消；API Key 尚未保存。")
+            return
+    else:
+        print(f"模型列表拉取成功，共 {len(models)} 个模型。")
+
+    old = data.get("channels", {}).get(slug)
+    old_models = _normalized_values(old.get("selected_models")) if old else []
+    old_efforts = _normalized_values(old.get("selected_efforts"), EFFORTS) if old else []
+    default_model = args.model or (old.get("model") if old else None)
+    if args.model:
+        model_pick = (old_models or [args.model], args.model)
+    else:
+        model_pick = choose_models(models, defaults=old_models, default_value=default_model)
+    if not model_pick:
+        print("已取消；没有选择模型，API Key 尚未保存。")
+        return
+    selected_models, model = model_pick
+
+    default_effort = args.reasoning or (old.get("reasoning_effort") if old else DEFAULT_EFFORT)
+    if args.reasoning:
+        effort_pick = (old_efforts or [args.reasoning], args.reasoning)
+    else:
+        effort_pick = choose_efforts(defaults=old_efforts or list(EFFORTS), default_value=default_effort)
+    if not effort_pick:
+        print("已取消；没有选择推理强度，API Key 尚未保存。")
+        return
+    selected_efforts, effort = effort_pick
+
+    if old and not args.force:
+        if not confirm_action(f"渠道 {slug} 已存在，覆盖它？"):
+            print("已取消；API Key 尚未写入。")
+            return
+    channel = {
+        "slug": slug, "name": name, "base_url": base_url,
+        "model": model, "reasoning_effort": effort,
+        "selected_models": selected_models, "selected_efforts": selected_efforts,
+        "models": models, "models_fetched_at": datetime.now(timezone.utc).isoformat(),
+        "created_at": old.get("created_at") if old else datetime.now(timezone.utc).isoformat(),
+        "enabled": bool(old and old.get("enabled")),
+    }
+    keychain_set(slug, api_key)
+    data.setdefault("channels", {})[slug] = channel
+    save_channels(data)
+    print(f"已保存渠道：{name} ({slug})，默认模型：{model}，候选模型：{len(selected_models)} 个")
+    if args.use:
+        select_channel(
+            slug, model=model, effort=effort,
+            selected_models=selected_models, selected_efforts=selected_efforts,
+            restart_app=args.restart_app,
+        )
+    else:
+        print(f"执行 `sgate use {slug}` 即可切换。")
+
+
+def refresh_models(slug: str, *, choose: bool = True, restart_app: bool = False) -> None:
+    data = load_channels()
+    channel = data.get("channels", {}).get(slug)
+    if not channel:
+        die(f"渠道不存在：{slug}")
+    key = keychain_get(slug)
+    print(f"正在从 {models_url(channel['base_url'])} 拉取模型列表……")
+    models, error = fetch_models(channel["base_url"], key)
+    if error:
+        die(f"模型拉取失败：{error}")
+    channel["models"] = models
+    channel["models_fetched_at"] = datetime.now(timezone.utc).isoformat()
+    selected_models = _normalized_values(channel.get("selected_models"))
+    default_model = str(channel.get("model") or DEFAULT_MODEL)
+    if choose:
+        picked = choose_models(models, defaults=selected_models, default_value=default_model)
+        if picked is None:
+            print("已取消模型变更；仅更新模型缓存。")
+            save_channels(data)
+            return
+        selected_models, default_model = picked
+        channel["selected_models"] = selected_models
+        channel["model"] = default_model
+    save_channels(data)
+    is_active = current_config_info()["provider_id"] == provider_id(slug)
+    if choose and is_active:
+        if confirm_action(
+            f"应用模型选择并立即重启 ChatGPT：默认 {default_model} / 共 {len(selected_models)} 个模型？",
+            default=True,
+        ):
+            select_channel(
+                slug,
+                model=default_model,
+                effort=channel.get("reasoning_effort"),
+                selected_models=selected_models,
+                selected_efforts=_normalized_values(channel.get("selected_efforts"), EFFORTS),
+                restart_app=restart_app,
+            )
+        else:
+            print("模型缓存和候选已保存，但当前 config.toml 没有改动。")
+    else:
+        print(f"已更新 {len(models)} 个模型，默认：{channel.get('model')}，候选：{len(selected_models)} 个")
+        if not is_active:
+            print("该渠道当前未启用；下次启用时会使用这些候选模型。")
+
+
+def choose_channel(title: str = "选择渠道") -> str | None:
+    data = load_channels()
+    channels = data.get("channels", {})
+    if not channels:
+        print("还没有 API Key 渠道，请先添加。")
+        return None
+    actual = current_config_info()["provider_id"]
+    options = []
+    for slug, channel in channels.items():
+        active = "  [当前启用]" if provider_id(slug) == actual else ""
+        options.append((slug, f"{channel.get('name', slug)} ({slug}) · {channel.get('model', '(未选)')}{active}"))
+    return terminal_menu(title, options)
+
+
+def configure_and_enable_channel(slug: str, *, restart_app: bool = True) -> None:
+    data = load_channels()
+    channel = data.get("channels", {}).get(slug)
+    if not channel:
+        die(f"渠道不存在：{slug}")
+    info = current_config_info()
+    is_active = info["provider_id"] == provider_id(slug)
+    models = channel.get("models", []) if isinstance(channel.get("models"), list) else []
+    default_model = info["model"] if is_active and info["model"] in models else channel.get("model")
+    default_effort = info["reasoning_effort"] if is_active and info["reasoning_effort"] in EFFORTS else channel.get("reasoning_effort")
+    selected_models = _normalized_values(channel.get("selected_models"))
+    selected_efforts = _normalized_values(channel.get("selected_efforts"), EFFORTS)
+    if not selected_models:
+        selected_models = [name for name in models if not any(
+            token in name.casefold() for token in ("image", "dall-e", "embedding", "whisper", "tts", "audio", "moderation")
+        )]
+    if not selected_efforts:
+        selected_efforts = list(EFFORTS)
+
+    model_pick = choose_models(models, defaults=selected_models, default_value=default_model)
+    if model_pick is None:
+        print("已取消切换。")
+        return
+    selected_models, model = model_pick
+    effort_pick = choose_efforts(defaults=selected_efforts, default_value=default_effort)
+    if effort_pick is None:
+        print("已取消切换。")
+        return
+    selected_efforts, effort = effort_pick
+    message = (
+        f"应用配置并立即重启 ChatGPT：{channel.get('name', slug)} / 默认 {model} / {effort} / "
+        f"{len(selected_models)} 个模型 / {len(selected_efforts)} 个强度？"
+    )
+    if not confirm_action(message, default=True):
+        print("已取消切换，配置没有改动。")
+        return
+    select_channel(
+        slug, model=model, effort=effort,
+        selected_models=selected_models, selected_efforts=selected_efforts,
+        restart_app=restart_app,
+    )
+
+
+def configure_current(*, restart_app: bool = True) -> None:
+    info = current_config_info()
+    data = load_channels()
+    slug = next((slug for slug in data.get("channels", {}) if provider_id(slug) == info["provider_id"]), None)
+    if slug:
+        configure_and_enable_channel(slug, restart_app=restart_app)
+        return
+    model = input(f"当前是非脚本渠道，请输入模型 [{info['model']}]（回车保持）：").strip() or info["model"]
+    effort = choose_effort(info.get("reasoning_effort"))
+    if effort is None:
+        print("已取消修改。")
+        return
+    if info["provider_id"] == "openai":
+        switch_login(model, effort)
+    else:
+        backup = backup_config()
+        write_config(update_top_level(read_config(), {"model": model, "model_reasoning_effort": effort}))
+        if backup:
+            print(f"已备份配置：{backup}")
+        print(f"已更新当前 provider 的 Model={model}, Reasoning={effort}。重启 App 后生效。")
+
+
+def print_current_status() -> None:
+    info = current_config_info()
+    data = load_channels()
+    provider_id_value = info["provider_id"]
+    matched = next((c for c in data.get("channels", {}).values() if provider_id(c.get("slug", "")) == provider_id_value), None)
+    print("\n当前实际生效配置")
+    print(f"  CODEX_HOME：{CODEX_HOME}")
+    print(f"  config.toml：{CONFIG_PATH}")
+    print(f"  provider：{provider_id_value}")
+    if provider_id_value == "openai":
+        print("  渠道类型：官方登录")
+    elif matched:
+        print(f"  渠道名称：{matched.get('name', matched.get('slug'))} ({matched.get('slug')})")
+        print(f"  Base URL：{matched.get('base_url', '(未记录)')}")
+    else:
+        provider = info["provider"]
+        print("  渠道类型：未登记的已有 provider")
+        print(f"  名称：{provider.get('name', '(未设置)')}")
+        print(f"  Base URL：{provider.get('base_url', '(未设置)')}")
+        print("  提示：这通常是手工配置或旧版配置；脚本不会读取 auth.json 中的密钥。")
+    print(f"  Model：{info['model']}")
+    print(f"  Reasoning：{info['reasoning_effort']}")
+    print(f"  API Key 渠道记录：{len(data.get('channels', {}))} 个")
+    cc = ccswitch_current_info()
+    if cc:
+        print(f"  CC Switch 当前记录：{cc['name']} | provider={cc['provider_id']} | model={cc['model']}")
+        if ccswitch_is_running():
+            print("  CC Switch 状态：正在运行；以后在 CC Switch 中切换可能覆盖本文件。")
+    print("  结论：上述 provider/model/reasoning 就是 Codex 下一次启动时会使用的值。")
+
+
+def list_channels() -> None:
+    print_current_status()
+    data = load_channels()
+    channels = data.get("channels", {})
+    if not channels:
+        print("\n暂无由本脚本管理的 API Key 渠道。执行 `sgate add` 添加。")
+        return
+    actual = current_config_info()["provider_id"]
+    print("\n已保存的 API Key 渠道：")
+    for slug, channel in channels.items():
+        mark = "*" if provider_id(slug) == actual else " "
+        count = len(channel.get("models", []))
+        print(f" {mark} {slug:20} {channel.get('name', slug)} | {channel.get('model', '(未选)')} | reasoning={channel.get('reasoning_effort', DEFAULT_EFFORT)} | models={count}")
+
+
+def remove_channel(slug: str) -> None:
+    data = load_channels()
+    channel = data.get("channels", {}).get(slug)
+    if not channel:
+        die(f"渠道不存在：{slug}")
+    if not confirm_action(f"确认永久删除渠道 {channel.get('name', slug)} 及其 Keychain 密钥？"):
+        print("已取消。")
+        return
+    if current_config_info()["provider_id"] == provider_id(slug):
+        deactivate_channel()
+        data = load_channels()
+    data["channels"].pop(slug, None)
+    save_channels(data)
+    keychain_delete(slug)
+    print(f"已删除渠道：{slug}")
+
+
+def doctor(slug: str | None) -> None:
+    data = load_channels()
+    slug = slug or next((s for s, c in data.get("channels", {}).items() if provider_id(s) == current_config_info()["provider_id"]), None)
+    if not slug:
+        print_current_status()
+        print("当前不是本脚本管理的 API Key 渠道，未执行 Keychain 检查。")
+        return
+    channel = data.get("channels", {}).get(slug)
+    if not channel:
+        die(f"渠道不存在：{slug}")
+    key = keychain_get(slug)
+    url = models_url(channel["base_url"])
+    print(f"检查：{channel['name']} ({slug})\nURL：{url}")
+    models, error = fetch_models(channel["base_url"], key)
+    if error:
+        die(f"模型接口失败：{error}")
+    channel["models"] = models
+    channel["models_fetched_at"] = datetime.now(timezone.utc).isoformat()
+    save_channels(data)
+    print(f"HTTP：200\n模型数量：{len(models)}")
+    print("当前模型：" + str(channel.get("model", "(未选择)")))
+    print("当前 reasoning：" + str(channel.get("reasoning_effort", DEFAULT_EFFORT)))
+
+
+def executable_version(path: str) -> str:
+    try:
+        proc = subprocess.run([path, "--version"], text=True, capture_output=True, timeout=8)
+        return (proc.stdout or proc.stderr).strip().splitlines()[0]
+    except Exception as exc:
+        return f"不可用：{exc}"
+
+
+def diagnose() -> None:
+    print_current_status()
+    print("\n运行时检查")
+    print(f"  当前 PATH 中 codex：{shutil.which('codex') or '(未找到)'}")
+    if shutil.which("codex"):
+        print(f"  standalone 版本：{executable_version(shutil.which('codex') or 'codex')}")
+    print(f"  ChatGPT.app 内置 codex：{CHATGPT_CODEX if CHATGPT_CODEX.exists() else '(未找到)'}")
+    if CHATGPT_CODEX.exists():
+        print(f"  ChatGPT.app Codex 版本：{executable_version(str(CHATGPT_CODEX))}")
+    cc = ccswitch_current_info()
+    if cc:
+        cc_state = "正在运行" if ccswitch_is_running() else "未运行"
+        print(f"  CC Switch：{cc_state}，当前记录为 {cc['name']} / provider={cc['provider_id']} / model={cc['model']}")
+        active = current_config_info()
+        if cc["provider_id"] != active["provider_id"] or cc["model"] != active["model"]:
+            print("  CC Switch 与 config.toml 不一致：当前实际 Codex 配置以 config.toml 为准；不要在 CC Switch 中再次切换，否则可能覆盖本次结果。")
+    print("\n作用判断")
+    print("  脚本修改的是 CODEX_HOME/config.toml；当前 CODEX_HOME 为上面显示的路径。")
+    print("  ChatGPT.app 正在运行时，已有 app-server 不会自动重新读取配置。")
+    print("  切换后请关闭并重新打开 ChatGPT.app，再从 Codex 页面新建会话。")
+    print("  若要验证内置 Codex 是否能读取配置：sgate app-doctor")
+
+
+def app_doctor() -> None:
+    if not CHATGPT_CODEX.exists():
+        die(f"找不到 ChatGPT.app 内置 Codex：{CHATGPT_CODEX}")
+    print(f"正在用 ChatGPT.app 内置 Codex 检查：{CHATGPT_CODEX}")
+    proc = subprocess.run(
+        [str(CHATGPT_CODEX), "--strict-config", "doctor"],
+        text=True, capture_output=True,
+    )
+    output = proc.stdout or proc.stderr
+    interesting = []
+    for line in output.splitlines():
+        if any(token in line for token in ("Codex Doctor", "version", "default model provider", "model provider", "model                    ", "config.toml parse", "auth")):
+            interesting.append(line)
+    print("\n".join(interesting[-30:]) if interesting else output[-4000:])
+    if proc.returncode != 0:
+        print(f"\n注意：doctor 返回码为 {proc.returncode}，这通常表示网络/渠道可达性检查失败；上面的 config.toml parse/provider 结果仍然有效。")
+
+
+def process_matches(pattern: str) -> bool:
+    try:
+        proc = subprocess.run(["pgrep", "-f", pattern], text=True, capture_output=True)
+    except FileNotFoundError:
+        return False
+    return proc.returncode == 0
+
+
+def chatgpt_pids() -> list[int]:
+    try:
+        proc = subprocess.run(["ps", "-axo", "pid=,command="], text=True, capture_output=True)
+    except FileNotFoundError:
+        return []
+    target = "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"
+    pids: list[int] = []
+    for line in proc.stdout.splitlines():
+        fields = line.strip().split(None, 1)
+        if len(fields) == 2 and fields[0].isdigit() and fields[1] == target:
+            pids.append(int(fields[0]))
+    return pids
+
+
+def chatgpt_is_running() -> bool:
+    return bool(chatgpt_pids())
+
+
+def ccswitch_is_running() -> bool:
+    return process_matches(r"/Applications/CC Switch\.app/Contents/")
+
+
+def restart_chatgpt(*, ask: bool = True) -> None:
+    if ask:
+        try:
+            confirmed = confirm_action("关闭并重新打开 ChatGPT？这可能中断正在运行的会话。", default=True)
+        except (KeyboardInterrupt, EOFError):
+            print("\n未重启 ChatGPT；请稍后手动重启。")
+            return
+        if not confirmed:
+            print("未重启 ChatGPT；请稍后手动重启。")
+            return
+
+    old_pids = set(chatgpt_pids())
+    if old_pids:
+        subprocess.run(["osascript", "-e", 'tell application "ChatGPT" to quit'], check=False, capture_output=True)
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and old_pids.intersection(chatgpt_pids()):
+            time.sleep(0.25)
+        remaining = old_pids.intersection(chatgpt_pids())
+        if remaining:
+            subprocess.run(["kill", *[str(pid) for pid in sorted(remaining)]], check=False, capture_output=True)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and remaining.intersection(chatgpt_pids()):
+                time.sleep(0.2)
+
+    opened = subprocess.run(["open", "-a", "ChatGPT"], text=True, capture_output=True)
+    if opened.returncode != 0:
+        die((opened.stderr or opened.stdout or "无法启动 ChatGPT.app").strip())
+    deadline = time.monotonic() + 20
+    new_pids: set[int] = set()
+    while time.monotonic() < deadline:
+        new_pids = set(chatgpt_pids()) - old_pids
+        if new_pids:
+            break
+        time.sleep(0.25)
+    if not new_pids:
+        die("已退出旧 ChatGPT.app，但没有检测到新的 ChatGPT 主进程。")
+    print(f"已重启 ChatGPT.app；新 PID：{', '.join(map(str, sorted(new_pids)))}。新进程将读取刚写入的配置。")
+
+
+def token_command(slug: str) -> None:
+    # Used internally by Codex's model provider auth.command.
+    sys.stdout.write(keychain_get(slug) + "\n")
+
+
+def interactive() -> None:
+    while True:
+        try:
+            info = current_config_info()
+            data = load_channels()
+            matched = next(
+                (channel for slug, channel in data.get("channels", {}).items() if provider_id(slug) == info["provider_id"]),
+                None,
+            )
+            channel_name = matched.get("name", matched.get("slug")) if matched else (
+                "官方登录" if info["provider_id"] == "openai" else info["provider_id"]
+            )
+            title = (
+                "Codex 渠道切换器\n"
+                f"  当前：{channel_name} · {info['model']} · reasoning={info['reasoning_effort']}"
+            )
+            choice = terminal_menu(title, [
+                ("use", "[切换] 启用已保存渠道，并选择模型 / 推理强度"),
+                ("configure", "[配置] 修改当前模型 / 推理强度"),
+                ("refresh", "[模型] 拉取最新列表，用 Space 选择 / 取消"),
+                ("disable", "[停用] 取消当前渠道（保留配置和 API Key）"),
+                ("add", "[新增] 添加或更新 API Key 渠道"),
+                ("login", "[官方] 切换到官方登录"),
+                ("status", "[状态] 查看当前实际配置"),
+                ("doctor", "[检查] 测试渠道连接"),
+                ("diagnose", "[诊断] 检查 CLI 与 ChatGPT.app"),
+                ("remove", "[删除] 永久删除渠道"),
+                ("exit", "[退出] 关闭菜单"),
+            ], default="use")
+            if choice in (None, "exit"):
+                return
+            if choice == "add":
+                add_channel(argparse.Namespace(name=None, slug=None, base_url=None, model=None, reasoning=None, force=False, use=True, restart_app=True))
+            elif choice == "use":
+                slug = choose_channel("启用哪个渠道？")
+                if slug:
+                    configure_and_enable_channel(slug, restart_app=True)
+            elif choice == "configure":
+                configure_current()
+            elif choice == "refresh":
+                slug = choose_channel("刷新哪个渠道的模型？")
+                if slug:
+                    refresh_models(slug, restart_app=True)
+            elif choice == "disable":
+                if confirm_action("取消启用当前脚本渠道？配置和 API Key 会保留，可随时重新启用。"):
+                    deactivate_channel(restart_app=True)
+                else:
+                    print("已返回，未修改配置。")
+            elif choice == "login":
+                effort = choose_effort(info.get("reasoning_effort"))
+                if effort is not None:
+                    switch_login(info.get("model"), effort)
+                    if chatgpt_is_running():
+                        restart_chatgpt(ask=False)
+            elif choice == "status":
+                list_channels()
+            elif choice == "doctor":
+                slug = choose_channel("检查哪个渠道？")
+                if slug:
+                    doctor(slug)
+            elif choice == "diagnose":
+                diagnose()
+            elif choice == "remove":
+                slug = choose_channel("永久删除哪个渠道？")
+                if slug:
+                    remove_channel(slug)
+            pause_after_action()
+        except (KeyboardInterrupt, EOFError):
+            print("\n已退出。")
+            return
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="sgate",
+        description="切换 Codex 全局 API Key 渠道或官方登录渠道；API Key 存储在 macOS Keychain。",
+    )
+    sub = parser.add_subparsers(dest="command")
+
+    p_add = sub.add_parser("add", help="添加/更新渠道，并自动拉取模型列表")
+    p_add.add_argument("name", nargs="?", help="显示名称")
+    p_add.add_argument("--slug", help="稳定标识")
+    p_add.add_argument("--base-url", help="OpenAI Responses API Base URL")
+    p_add.add_argument("--model", help="跳过选择器，直接指定模型；不填则自动拉取并选择")
+    p_add.add_argument("--reasoning", choices=EFFORTS, help="默认推理强度")
+    p_add.add_argument("--force", action="store_true", help="覆盖已有渠道而不询问")
+    p_add.add_argument("--use", action="store_true", help="添加后立即切换")
+    p_add.add_argument("--restart-app", action="store_true", help="切换后立即重启 ChatGPT.app")
+
+    p_use = sub.add_parser("use", help="切换 API Key 渠道")
+    p_use.add_argument("slug")
+    p_use.add_argument("--model", help="指定模型")
+    p_use.add_argument("--reasoning", choices=EFFORTS, help="指定推理强度")
+    p_use.add_argument("--restart-app", action="store_true", help="切换后立即重启 ChatGPT.app")
+
+    p_login = sub.add_parser("login", help="切回官方登录，不删除 auth.json")
+    p_login.add_argument("--model")
+    p_login.add_argument("--reasoning", choices=EFFORTS)
+    p_login.add_argument("--restart-app", action="store_true", help="切换后立即重启 ChatGPT.app")
+
+    p_disable = sub.add_parser("disable", aliases=["cancel", "deactivate"], help="取消启用当前脚本渠道，但保留渠道和 Keychain 密钥")
+    p_disable.add_argument("--restart-app", action="store_true", help="停用后立即重启 ChatGPT.app")
+
+    p_configure = sub.add_parser("configure", aliases=["config"], help="交互修改渠道的模型和推理强度")
+    p_configure.add_argument("slug", nargs="?", help="渠道 slug；不填则修改当前配置")
+    p_configure.add_argument("--restart-app", action="store_true", help="修改后立即重启 ChatGPT.app")
+
+    sub.add_parser("list", aliases=["ls"], help="显示当前实际渠道和已保存渠道")
+    sub.add_parser("status", aliases=["current"], help="只显示当前实际生效配置")
+
+    p_refresh = sub.add_parser("refresh", help="重新拉取模型并重新选择")
+    p_refresh.add_argument("slug")
+    p_refresh.add_argument("--restart-app", action="store_true", help="选定后立即重启 ChatGPT.app")
+
+    p_rm = sub.add_parser("remove", aliases=["rm"], help="删除渠道和 Keychain 密钥")
+    p_rm.add_argument("slug")
+
+    p_doctor = sub.add_parser("doctor", help="检查 API Key 渠道 /models")
+    p_doctor.add_argument("slug", nargs="?")
+    sub.add_parser("diagnose", help="检查 CLI、ChatGPT.app 和实际 config")
+    sub.add_parser("app-doctor", help="用 ChatGPT.app 内置 Codex 检查 config")
+
+    p_run = sub.add_parser("run", help="用当前全局配置启动 standalone codex")
+    p_run.add_argument("args", nargs=argparse.REMAINDER)
+
+    p_token = sub.add_parser("token", help=argparse.SUPPRESS)
+    p_token.add_argument("slug")
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    if not args.command:
+        interactive()
+    elif args.command == "add":
+        add_channel(args)
+    elif args.command == "use":
+        select_channel(args.slug, model=args.model, effort=args.reasoning, restart_app=args.restart_app)
+    elif args.command == "login":
+        switch_login(args.model, args.reasoning)
+        if args.restart_app and chatgpt_is_running():
+            restart_chatgpt(ask=False)
+    elif args.command in ("disable", "cancel", "deactivate"):
+        deactivate_channel(restart_app=args.restart_app)
+    elif args.command in ("configure", "config"):
+        if args.slug:
+            configure_and_enable_channel(args.slug, restart_app=args.restart_app)
+        else:
+            configure_current(restart_app=args.restart_app)
+    elif args.command in ("list", "ls"):
+        list_channels()
+    elif args.command in ("status", "current"):
+        print_current_status()
+    elif args.command == "refresh":
+        refresh_models(args.slug, restart_app=args.restart_app)
+    elif args.command in ("remove", "rm"):
+        remove_channel(args.slug)
+    elif args.command == "doctor":
+        doctor(args.slug)
+    elif args.command == "diagnose":
+        diagnose()
+    elif args.command == "app-doctor":
+        app_doctor()
+    elif args.command == "run":
+        os.execvp("codex", ["codex", *args.args])
+    elif args.command == "token":
+        token_command(args.slug)
+
+
+if __name__ == "__main__":
+    main()
