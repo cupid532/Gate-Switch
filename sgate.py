@@ -61,7 +61,18 @@ CCSWITCH_DB = Path.home() / ".cc-switch" / "cc-switch.db"
 DEFAULT_MODEL = "gpt-5.6"
 DEFAULT_EFFORT = "high"
 EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
-CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh")
+CLAUDE_EFFORTS = ("low", "medium", "high")
+CLAUDE_ROLES = ("opus", "sonnet", "haiku")
+CLAUDE_MANAGED_ENV = (
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+)
+CLAUDE_TAKEOVER_KEY = "claude_code"
+# An identity-only sentinel cannot collide with a legitimate JSON value. New
+# journal entries also persist an explicit ``exists`` bit for portability.
+_MISSING = object()
 _KEY_PUSHBACK: dict[int, list[bytes]] = {}
 
 # ---------------------------------------------------------------------------
@@ -179,11 +190,30 @@ def print_table(headers: list[str], rows: list[list[str]], *, indent: int = 2) -
     for row in rows:
         for i, cell in enumerate(row):
             widths[i] = max(widths[i], display_width(cell))
+    terminal_width = max(20, shutil.get_terminal_size((88, 24)).columns - indent)
+    separator_width = 2 * (len(widths) - 1)
+    while sum(widths) + separator_width > terminal_width and max(widths) > 8:
+        index = max(range(len(widths)), key=widths.__getitem__)
+        widths[index] -= 1
+
+    def clip(value: str, width: int) -> str:
+        if display_width(value) <= width:
+            return value
+        # Do not split ANSI escape sequences when a colored cell must be truncated.
+        value = re.sub(r"\033\[[0-9;]*m", "", value)
+        suffix = "…"
+        out = ""
+        for char in value:
+            if display_width(out + char + suffix) > width:
+                break
+            out += char
+        return out + suffix
+
     prefix = " " * indent
-    print(prefix + "  ".join(dim(bold(pad(h, widths[i]))) for i, h in enumerate(headers)).rstrip())
-    print(prefix + dim("─" * (sum(widths) + 2 * (len(widths) - 1))))
+    print(prefix + "  ".join(dim(bold(pad(clip(h, widths[i]), widths[i]))) for i, h in enumerate(headers)).rstrip())
+    print(prefix + dim("─" * (sum(widths) + separator_width)))
     for row in rows:
-        print(prefix + "  ".join(pad(cell, widths[i]) for i, cell in enumerate(row)).rstrip())
+        print(prefix + "  ".join(pad(clip(cell, widths[i]), widths[i]) for i, cell in enumerate(row)).rstrip())
 
 
 def die(message: str, code: int = 1) -> None:
@@ -432,7 +462,7 @@ def terminal_radio(title: str, options: list[tuple[str, str]], *, default: str |
             help_text = (
                 "输入关键词筛选 · Backspace 删除 · Enter 完成筛选 · Esc 清空"
                 if searching else
-                "↑↓ 移动 · Space 选择/取消 · Enter 应用选择 · / 搜索 · Esc 返回"
+                "↑↓ 移动 · Space 选择/取消 · Enter 确认 · / 搜索 · Esc 取消"
             )
             _paint_picker(title, filtered, cursor, selected, help_text=help_text, query=query)
             key = _raw_key(fd)
@@ -490,7 +520,7 @@ def terminal_multi(
     default_value: str | None = None,
     searchable: bool = False,
 ) -> tuple[list[str], str] | None:
-    """Checkbox picker. Space toggles many; Enter sets cursor item as default."""
+    """Checkbox picker. Space selects, ``d`` sets the default, Enter confirms."""
     if not options:
         return None
     allowed = {value for value, _ in options}
@@ -518,7 +548,8 @@ def terminal_multi(
 
     all_options = options
     filtered = options
-    cursor = next((i for i, (value, _) in enumerate(filtered) if value == default_value), 0)
+    current_default = default_value if default_value in allowed else next(iter(selected_values), None)
+    cursor = next((i for i, (value, _) in enumerate(filtered) if value == current_default), 0)
     query = ""
     searching = False
     fd = sys.stdin.fileno()
@@ -533,7 +564,7 @@ def terminal_multi(
             help_text = (
                 "输入关键词筛选 · Backspace 删除 · Enter 完成筛选 · Esc 清空"
                 if searching else
-                "↑↓ 移动 · Space 勾选/取消多个 · Enter 将光标项设为默认并继续 · / 搜索 · Esc 返回"
+                "↑↓ 移动 · Space 勾选/取消 · d 设为默认 · Enter 确认 · / 搜索 · Esc 取消"
             )
             _paint_picker(title, filtered, cursor, selected_indexes, help_text=help_text, query=query)
             key = _raw_key(fd)
@@ -573,10 +604,14 @@ def terminal_multi(
                     selected_values.remove(value)
                 else:
                     selected_values.add(value)
+            elif key == "d":
+                current_default = filtered[cursor][0]
+                selected_values.add(current_default)
             elif key == "enter":
-                default = filtered[cursor][0]
-                selected_values.add(default)
                 selected = [value for value, _ in all_options if value in selected_values]
+                if not selected:
+                    return None
+                default = current_default if current_default in selected_values else selected[0]
                 return selected, default
             elif key == "/" and searchable:
                 query = ""
@@ -648,6 +683,41 @@ def pause_after_action() -> None:
             pass
 
 
+def migrate_legacy_claude_profiles(data: dict[str, Any]) -> bool:
+    """Mark legacy Claude selections as ambiguous without inventing endpoints/maps."""
+    changed = False
+    channels = data.get("channels", {})
+    if not isinstance(channels, dict):
+        return False
+    legacy_names = (
+        "claude_model", "claude_selected_models", "claude_selected",
+        "claude_reasoning_effort", "claude_selected_efforts",
+    )
+    for channel in channels.values():
+        if not isinstance(channel, dict):
+            continue
+        protocols = channel.get("protocols")
+        protocols = protocols if isinstance(protocols, dict) else {}
+        anthropic = protocols.get("anthropic")
+        if ((isinstance(anthropic, dict) and anthropic.get("base_url")) or channel.get("claude_base_url")):
+            continue
+        hint = {name: channel[name] for name in legacy_names if name in channel}
+        if "claude_model" in hint and "selected" in channel:
+            hint["selected"] = channel["selected"]
+        if not hint:
+            continue
+        anthropic = dict(anthropic) if isinstance(anthropic, dict) else {}
+        if anthropic.get("migration_status") != "needs_configuration" or anthropic.get("legacy_hint") != hint:
+            anthropic.update({
+                "migration_status": "needs_configuration",
+                "legacy_hint": hint,
+            })
+            protocols["anthropic"] = anthropic
+            channel["protocols"] = protocols
+            changed = True
+    return changed
+
+
 def load_channels() -> dict[str, Any]:
     if not CHANNELS_PATH.exists():
         return {"version": 1, "active": None, "channels": {}}
@@ -657,6 +727,9 @@ def load_channels() -> dict[str, Any]:
         die(f"无法读取 {CHANNELS_PATH}：{exc}")
     if not isinstance(data, dict) or not isinstance(data.get("channels", {}), dict):
         die(f"渠道文件格式损坏：{CHANNELS_PATH}")
+    # Keep migration in memory until the next intentional mutation so opening or
+    # cancelling an interactive picker never writes channels.json by itself.
+    migrate_legacy_claude_profiles(data)
     return data
 
 
@@ -907,71 +980,426 @@ def claude_settings_read() -> dict[str, Any]:
     return value
 
 
+def validate_claude_settings_shape(settings: dict[str, Any]) -> None:
+    """Fail closed before any backup, Keychain, journal, or settings write."""
+    if "env" in settings and not isinstance(settings.get("env"), dict):
+        die("Claude Code settings.json 的 env 必须是 JSON 对象；已停止，未修改任何配置。")
+
+
+def _safe_claude_settings_snapshot(settings: dict[str, Any]) -> dict[str, Any]:
+    """Return a value-free manifest; never duplicate settings or commands."""
+    env = settings.get("env") if isinstance(settings, dict) else None
+    return {
+        "_sgate_backup_manifest": True,
+        "keys": sorted(str(key) for key in settings) if isinstance(settings, dict) else [],
+        "env_keys": sorted(str(key) for key in env) if isinstance(env, dict) else [],
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 def claude_settings_backup(settings: dict[str, Any] | None = None) -> Path | None:
     if not CLAUDE_CODE_SETTINGS_PATH.exists():
         return None
     CLAUDE_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     backup = CLAUDE_BACKUP_DIR / f"settings.json.sgate-{now_stamp()}.bak"
-    if settings is None:
-        shutil.copy2(CLAUDE_CODE_SETTINGS_PATH, backup)
-    else:
-        backup.write_text(json.dumps(settings, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        os.chmod(backup, 0o600)
+    safe = _safe_claude_settings_snapshot(settings if settings is not None else claude_settings_read())
+    backup.write_text(json.dumps(safe, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.chmod(backup, 0o600)
     return backup
 
 
 def claude_settings_write(settings: dict[str, Any]) -> None:
+    """Atomically replace settings after a single caller-owned read."""
     CLAUDE_CODE_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp = CLAUDE_CODE_SETTINGS_PATH.with_suffix(".tmp")
-    tmp.write_text(json.dumps(settings, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, CLAUDE_CODE_SETTINGS_PATH)
-    os.chmod(CLAUDE_CODE_SETTINGS_PATH, 0o600)
+    tmp = CLAUDE_CODE_SETTINGS_PATH.with_name(
+        f".{CLAUDE_CODE_SETTINGS_PATH.name}.sgate-{os.getpid()}-{now_stamp()}.tmp"
+    )
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(settings, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, CLAUDE_CODE_SETTINGS_PATH)
+        os.chmod(CLAUDE_CODE_SETTINGS_PATH, 0o600)
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
 
 
-def claude_env(settings: dict[str, Any]) -> dict[str, str]:
-    value = settings.get("env", {})
-    return {str(k): str(v) for k, v in value.items()} if isinstance(value, dict) else {}
+def claude_env(settings: dict[str, Any]) -> dict[str, Any]:
+    """Return settings.env after validating its JSON shape.
+
+    Claude settings permits an object here. Silently coercing a string/list to
+    an empty object would destroy user configuration, so callers must fail
+    closed when a non-object env is present.
+    """
+    if "env" not in settings:
+        return {}
+    value = settings.get("env")
+    if not isinstance(value, dict):
+        die("Claude Code settings.json 的 env 必须是 JSON 对象；已停止，未修改配置。")
+    return json.loads(json.dumps(value, ensure_ascii=False))
 
 
-def claude_model_families(model: str) -> dict[str, str]:
-    lower = model.casefold()
-    families: dict[str, str] = {}
-    if "fable" in lower:
-        families["fable"] = model
-    elif "opus" in lower:
-        families["opus"] = model
-    elif "sonnet" in lower:
-        families["sonnet"] = model
-    elif "haiku" in lower:
-        families["haiku"] = model
-    return families
-
-
-def _safe_claude_settings_snapshot(settings: dict[str, Any]) -> dict[str, Any]:
-    """Keep a restorable settings snapshot without copying API credentials."""
-    snapshot = json.loads(json.dumps(settings, ensure_ascii=False))
-    env = snapshot.get("env")
-    if isinstance(env, dict):
-        for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
-            env.pop(key, None)
-    return snapshot
+def _claude_helper_slug(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        argv = shlex.split(value)
+    except ValueError:
+        return None
+    if len(argv) != 3 or argv[1] != "claude-token":
+        return None
+    try:
+        owned = Path(argv[0]).expanduser().resolve() == SCRIPT_PATH.resolve()
+    except OSError:
+        owned = False
+    return argv[2] if owned else None
 
 
 def _is_sgate_claude_helper(value: Any) -> bool:
-    return isinstance(value, str) and "claude-token" in value and SCRIPT_PATH.name in value
+    return _claude_helper_slug(value) is not None
 
 
 def _is_sgate_channel_helper(value: Any) -> bool:
-    return _is_sgate_claude_helper(value) and CLAUDE_ORIGINAL_KEY_SLUG not in str(value)
+    slug = _claude_helper_slug(value)
+    return bool(slug and slug != CLAUDE_ORIGINAL_KEY_SLUG)
+
+
+def _pointer_parts(path: str) -> list[str]:
+    if not path.startswith("/"):
+        raise ValueError(f"invalid JSON pointer: {path}")
+    return [part.replace("~1", "/").replace("~0", "~") for part in path[1:].split("/")]
+
+
+def _pointer_get(document: dict[str, Any], path: str) -> Any:
+    value: Any = document
+    for part in _pointer_parts(path):
+        if not isinstance(value, dict) or part not in value:
+            return _MISSING
+        value = value[part]
+    return json.loads(json.dumps(value, ensure_ascii=False))
+
+
+def _pointer_set(document: dict[str, Any], path: str, value: Any) -> None:
+    parts = _pointer_parts(path)
+    target: dict[str, Any] = document
+    for part in parts[:-1]:
+        if part not in target:
+            target[part] = {}
+        elif not isinstance(target[part], dict):
+            raise ValueError(f"cannot write JSON pointer through non-object ancestor: {path}")
+        target = target[part]
+    target[parts[-1]] = json.loads(json.dumps(value, ensure_ascii=False))
+
+
+def _pointer_delete(document: dict[str, Any], path: str) -> None:
+    parts = _pointer_parts(path)
+    target: Any = document
+    for part in parts[:-1]:
+        if not isinstance(target, dict) or part not in target:
+            return
+        target = target[part]
+    if isinstance(target, dict):
+        target.pop(parts[-1], None)
+
+
+def _is_missing(value: Any) -> bool:
+    return value is _MISSING
+
+
+class ClaudeManagedPlan:
+    __slots__ = ("desired", "managed_paths", "diagnostics", "supported", "pointer_values")
+
+    def __init__(
+        self, desired: dict[str, Any], managed_paths: tuple[str, ...],
+        diagnostics: tuple[str, ...], supported: bool,
+        pointer_values: dict[str, Any] | None = None,
+    ):
+        self.desired = desired
+        self.managed_paths = managed_paths
+        self.diagnostics = diagnostics
+        self.supported = supported
+        self.pointer_values = pointer_values or {}
+
+    @property
+    def desired_pointers(self) -> dict[str, Any]:
+        return dict(self.pointer_values)
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return getattr(self, key, default)
+
+    def __repr__(self) -> str:
+        return (
+            f"ClaudeManagedPlan(desired={self.desired!r}, managed_paths={self.managed_paths!r}, "
+            f"diagnostics={self.diagnostics!r}, supported={self.supported!r})"
+        )
+
+
+def _anthropic_profile_sections(profile: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    protocols = profile.get("protocols")
+    protocols = protocols if isinstance(protocols, dict) else {}
+    anthropic = protocols.get("anthropic")
+    anthropic = dict(anthropic) if isinstance(anthropic, dict) else {}
+    if not anthropic:
+        flat_map = profile.get("claude_model_map")
+        anthropic = {
+            "base_url": profile.get("anthropic_base_url") or profile.get("claude_base_url"),
+            "models": (
+                profile.get("anthropic_models") if isinstance(profile.get("anthropic_models"), list)
+                else profile.get("claude_models") if isinstance(profile.get("claude_models"), list)
+                else None
+            ),
+            "models_source": profile.get("anthropic_models_source") or profile.get("claude_models_source"),
+            "auth": profile.get("anthropic_auth") if isinstance(profile.get("anthropic_auth"), dict) else {
+                "mode": profile.get("auth_mode") or profile.get("claude_auth_mode"),
+                "secret_ref": profile.get("auth_secret_ref") or profile.get("claude_secret_ref"),
+            },
+        }
+    runtimes = profile.get("runtimes")
+    runtimes = runtimes if isinstance(runtimes, dict) else {}
+    runtime = runtimes.get("claude_code")
+    runtime = dict(runtime) if isinstance(runtime, dict) else {}
+    if not runtime:
+        flat_map = profile.get("claude_model_map")
+        runtime = {
+            "default_role": profile.get("default_role") or profile.get("claude_default_role"),
+            "effort": profile.get("effort") or profile.get("claude_effort") or profile.get("claude_reasoning_effort"),
+            "model_map": (
+                profile.get("model_map") if isinstance(profile.get("model_map"), dict)
+                else flat_map if isinstance(flat_map, dict) else None
+            ),
+        }
+    # A catalog list never implies a role mapping. Every Claude alias must be
+    # selected explicitly (or through --map-all at the input boundary).
+    return anthropic, runtime
+
+
+def compile_claude_managed_values(
+    profile: dict[str, Any], capabilities: dict[str, Any] | None = None,
+) -> ClaudeManagedPlan:
+    """Compile the exact Claude Code settings managed by SGate, failing closed."""
+    if not isinstance(profile, dict):
+        return ClaudeManagedPlan({}, (), ("profile must be an object",), False)
+    anthropic, runtime = _anthropic_profile_sections(profile)
+    diagnostics: list[str] = []
+    base_url = str(anthropic.get("base_url") or "").strip().rstrip("/")
+    if not re.match(r"^https?://", base_url, re.I):
+        diagnostics.append("Anthropic Base URL is required and must start with http:// or https://")
+    model_map = runtime.get("model_map")
+    if not isinstance(model_map, dict):
+        model_map = {}
+    normalized_map = {role: str(model_map.get(role) or "").strip() for role in CLAUDE_ROLES}
+    missing = [role for role, model in normalized_map.items() if not model]
+    extra = [str(role) for role in model_map if role not in CLAUDE_ROLES]
+    if missing:
+        diagnostics.append(f"explicit model mapping required for: {', '.join(missing)}")
+    if extra:
+        diagnostics.append(f"unsupported Claude aliases: {', '.join(extra)}")
+    default_role = str(runtime.get("default_role") or "").strip().casefold()
+    if default_role not in CLAUDE_ROLES:
+        diagnostics.append("default_role must be one of: opus, sonnet, haiku")
+    effort = str(runtime.get("effort") or "").strip().casefold()
+    if effort not in CLAUDE_EFFORTS:
+        diagnostics.append("effort must be one of: low, medium, high")
+    auth = anthropic.get("auth")
+    auth = auth if isinstance(auth, dict) else {}
+    auth_mode = str(auth.get("mode") or "api_key_helper").strip()
+    if auth_mode != "api_key_helper":
+        diagnostics.append(
+            f"auth mode {auth_mode!r} is unsupported for persistent Claude settings; use api_key_helper"
+        )
+    secret_ref = str(auth.get("secret_ref") or profile.get("slug") or "").strip()
+    if not secret_ref:
+        diagnostics.append("auth.secret_ref or profile.slug is required")
+    if diagnostics:
+        return ClaudeManagedPlan({}, (), tuple(diagnostics), False)
+    helper = f"{shlex.quote(str(SCRIPT_PATH))} claude-token {shlex.quote(secret_ref)}"
+    pointer_values = {
+        "/model": default_role,
+        "/effortLevel": effort,
+        "/apiKeyHelper": helper,
+        "/env/ANTHROPIC_BASE_URL": base_url,
+        "/env/ANTHROPIC_DEFAULT_OPUS_MODEL": normalized_map["opus"],
+        "/env/ANTHROPIC_DEFAULT_SONNET_MODEL": normalized_map["sonnet"],
+        "/env/ANTHROPIC_DEFAULT_HAIKU_MODEL": normalized_map["haiku"],
+    }
+    # Keep the public result convenient for callers while applications use exact pointers.
+    desired = {
+        "model": default_role,
+        "effortLevel": effort,
+        "apiKeyHelper": helper,
+        "env": {
+            "ANTHROPIC_BASE_URL": base_url,
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": normalized_map["opus"],
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": normalized_map["sonnet"],
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL": normalized_map["haiku"],
+        },
+    }
+    caps = capabilities if isinstance(capabilities, dict) else {}
+    # Keep pointer aliases for callers/tests while the actual settings patch uses
+    # the structured top-level representation above.
+    desired.update(pointer_values)
+    return ClaudeManagedPlan(desired, tuple(pointer_values), (), True, pointer_values)
+
+
+def _claude_profile(
+    channel: dict[str, Any], *, anthropic_base_url: str | None = None,
+    model_map: dict[str, str] | None = None, default_role: str | None = None,
+    effort: str | None = None, auth_mode: str | None = None,
+) -> dict[str, Any]:
+    profile = json.loads(json.dumps(channel, ensure_ascii=False))
+    anthropic, runtime = _anthropic_profile_sections(profile)
+    if anthropic_base_url is not None:
+        anthropic["base_url"] = anthropic_base_url
+    if model_map is not None:
+        # The Anthropic catalog is a list; the runtime role mapping is the
+        # separate authoritative dictionary.
+        anthropic["models"] = list(dict.fromkeys(str(value) for value in model_map.values()))
+        runtime["model_map"] = dict(model_map)
+    if default_role is not None:
+        runtime["default_role"] = default_role
+    if effort is not None:
+        runtime["effort"] = effort
+    auth = anthropic.get("auth")
+    auth = dict(auth) if isinstance(auth, dict) else {}
+    auth["mode"] = auth_mode or auth.get("mode") or "api_key_helper"
+    auth["secret_ref"] = channel.get("slug")
+    anthropic["auth"] = auth
+    protocols = profile.setdefault("protocols", {})
+    protocols["anthropic"] = anthropic
+    runtimes = profile.setdefault("runtimes", {})
+    runtimes["claude_code"] = runtime
+    return profile
+
+
+def _secret_before_reference(path: str, before: Any) -> Any:
+    if path not in ("/env/ANTHROPIC_API_KEY", "/env/ANTHROPIC_AUTH_TOKEN") or _is_missing(before):
+        return before
+    restore_slug = (
+        CLAUDE_ORIGINAL_KEY_SLUG
+        if path.endswith("ANTHROPIC_AUTH_TOKEN")
+        else f"{CLAUDE_ORIGINAL_KEY_SLUG}-api-key"
+    )
+    keychain_set(restore_slug, str(before))
+    return {"keychain_restore_ref": restore_slug}
+
+
+def _journal_value(value: Any) -> Any:
+    if _is_missing(value):
+        return {"__sgate_journal_missing__": True}
+    return json.loads(json.dumps(value, ensure_ascii=False))
+
+
+def _journal_decode(value: Any) -> Any:
+    if isinstance(value, dict) and value.get("__sgate_journal_missing__") is True:
+        return _MISSING
+    return value
+
+
+def _journal_before_value(entry: dict[str, Any]) -> Any:
+    before = _journal_decode(entry.get("before", _MISSING))
+    if isinstance(before, dict) and before.get("keychain_restore_ref"):
+        slug = str(before["keychain_restore_ref"])
+        return keychain_get(slug)
+    return before
+
+
+def _apply_claude_plan(
+    settings: dict[str, Any], data: dict[str, Any], plan: ClaudeManagedPlan,
+) -> dict[str, Any]:
+    state = data.setdefault("runtime_state", {})
+    claude_state = state.setdefault(CLAUDE_TAKEOVER_KEY, {})
+    takeover = claude_state.get("takeover")
+    if not isinstance(takeover, dict):
+        takeover = {
+            "target_path": str(CLAUDE_CODE_SETTINGS_PATH),
+            "file_existed": CLAUDE_CODE_SETTINGS_PATH.exists(),
+            "env_existed": isinstance(settings.get("env"), dict),
+            "original_mode": (
+                CLAUDE_CODE_SETTINGS_PATH.stat().st_mode & 0o777
+                if CLAUDE_CODE_SETTINGS_PATH.exists() else None
+            ),
+            "entries": [],
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        claude_state["takeover"] = takeover
+    entries = takeover.setdefault("entries", [])
+    by_path = {entry.get("path"): entry for entry in entries if isinstance(entry, dict)}
+    managed_now = list(plan.managed_paths)
+    for path in (
+        "/env/ANTHROPIC_API_KEY", "/env/ANTHROPIC_AUTH_TOKEN",
+        "/env/ANTHROPIC_MODEL", "/env/ANTHROPIC_DEFAULT_FABLE_MODEL",
+        "/env/CLAUDE_CODE_EFFORT_LEVEL",
+    ):
+        if not _is_missing(_pointer_get(settings, path)) and path not in managed_now:
+            managed_now.append(path)
+    for path in managed_now:
+        desired = plan.pointer_values.get(path, _MISSING)
+        before = _pointer_get(settings, path)
+        entry = by_path.get(path)
+        if entry is None:
+            entry = {
+                "path": path,
+                "before": _journal_value(_secret_before_reference(path, before)),
+                "applied": _journal_value(desired),
+            }
+            entries.append(entry)
+            by_path[path] = entry
+        else:
+            entry["applied"] = _journal_value(desired)
+        if _is_missing(desired):
+            _pointer_delete(settings, path)
+        else:
+            _pointer_set(settings, path, desired)
+    takeover["updated_at"] = datetime.now(timezone.utc).isoformat()
+    return takeover
+
+
+def _restore_claude_takeover(
+    settings: dict[str, Any], takeover: dict[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    conflicts: list[str] = []
+    entries = takeover.get("entries", [])
+    for entry in entries if isinstance(entries, list) else []:
+        if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
+            continue
+        path = entry["path"]
+        local = _pointer_get(settings, path)
+        applied = _journal_decode(entry.get("applied", _MISSING))
+        try:
+            before = _journal_before_value(entry)
+        except SystemExit:
+            conflicts.append(f"{path} (restore credential unavailable)")
+            continue
+        if local == applied:
+            if _is_missing(before):
+                _pointer_delete(settings, path)
+            else:
+                _pointer_set(settings, path, before)
+        elif local == before:
+            continue
+        else:
+            conflicts.append(path)
+    env = settings.get("env")
+    if isinstance(env, dict) and not env and not takeover.get("env_existed", False):
+        settings.pop("env", None)
+    return settings, conflicts
 
 
 def claude_current_info() -> dict[str, Any]:
     settings = claude_settings_read()
     env = claude_env(settings)
-    model = str(settings.get("model") or env.get("ANTHROPIC_MODEL") or "default")
-    effort = str(settings.get("effortLevel") or env.get("CLAUDE_CODE_EFFORT_LEVEL") or "auto")
-    base_url = env.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
+    model = str(settings.get("model") or "default")
+    effort = str(settings.get("effortLevel") or "auto")
+    base_url = env.get("ANTHROPIC_BASE_URL", "(未配置)")
     token_set = bool(env.get("ANTHROPIC_AUTH_TOKEN") or env.get("ANTHROPIC_API_KEY") or settings.get("apiKeyHelper"))
     return {
         "model": model,
@@ -983,167 +1411,214 @@ def claude_current_info() -> dict[str, Any]:
 
 
 def claude_provider_models(channel: dict[str, Any]) -> list[str]:
-    selected = _normalized_values(_channel_value(channel, "claude", "selected_models"))
-    default = str(_channel_value(channel, "claude", "model") or channel.get("model") or DEFAULT_MODEL)
-    if default not in selected:
-        selected.insert(0, default)
-    return selected
+    anthropic, runtime = _anthropic_profile_sections(channel)
+    model_map = runtime.get("model_map")
+    if not isinstance(model_map, dict):
+        return _normalized_values(anthropic.get("models"))
+    return [str(model_map[role]) for role in CLAUDE_ROLES if isinstance(model_map.get(role), str) and model_map.get(role)]
+
+
+def _parse_model_map(values: list[str] | None, map_all: str | None = None) -> dict[str, str] | None:
+    if map_all and values:
+        die("--map-all 与 --map 不能同时使用")
+    if map_all:
+        return {role: map_all for role in CLAUDE_ROLES}
+    if not values:
+        return None
+    result: dict[str, str] = {}
+    for value in values:
+        if "=" not in value:
+            die(f"Claude 映射必须为 role=model：{value}")
+        role, model = (part.strip() for part in value.split("=", 1))
+        role = role.casefold()
+        if role not in CLAUDE_ROLES or not model:
+            die(f"Claude 映射必须覆盖 opus/sonnet/haiku：{value}")
+        if role in result:
+            die(f"Claude 映射重复指定 role：{role}")
+        result[role] = model
+    return result
 
 
 def select_claude_code_channel(
     slug: str,
     *,
-    model: str | None = None,
+    anthropic_base_url: str | None = None,
+    model_map: dict[str, str] | None = None,
+    default_role: str | None = None,
     effort: str | None = None,
+    auth_mode: str | None = None,
+    model: str | None = None,
     selected_models: list[str] | None = None,
     selected_efforts: list[str] | None = None,
 ) -> None:
+    """Activate a complete explicit Claude profile; ``model`` is map-all only."""
     data = load_channels()
     channel = data.get("channels", {}).get(slug)
-    if not channel:
+    if not isinstance(channel, dict):
         die(f"渠道不存在：{slug}。先执行 add。")
-    model = model or str(_channel_value(channel, "claude", "model") or channel.get("model") or "sonnet")
-    effort = effort or str(_channel_value(channel, "claude", "reasoning_effort") or "high")
-    if effort not in CLAUDE_EFFORTS:
-        die(f"Claude Code 思考强度必须是：{', '.join(CLAUDE_EFFORTS)}")
-    models = _normalized_values(selected_models) if selected_models is not None else claude_provider_models(channel)
-    if model not in models:
-        models.insert(0, model)
-    efforts = _normalized_values(selected_efforts, CLAUDE_EFFORTS) if selected_efforts is not None else _normalized_values(
-        _channel_value(channel, "claude", "selected_efforts"), CLAUDE_EFFORTS
+    if model:
+        if model_map:
+            die("--model 与 --map/--map-all 不能同时使用")
+        print_note("--model 是兼容输入：当前值将显式映射到 opus/sonnet/haiku。", kind="warn")
+        model_map = {role: model for role in CLAUDE_ROLES}
+    profile = _claude_profile(
+        channel, anthropic_base_url=anthropic_base_url, model_map=model_map,
+        default_role=default_role, effort=effort, auth_mode=auth_mode,
     )
-    if effort not in efforts:
-        efforts.append(effort)
-
+    plan = compile_claude_managed_values(profile)
+    if not plan.supported:
+        die("Claude 配置不完整：" + "；".join(plan.diagnostics))
+    protocols = profile["protocols"]
+    runtimes = profile["runtimes"]
+    protocols["anthropic"].pop("migration_status", None)
+    protocols["anthropic"].pop("legacy_hint", None)
+    protocols["anthropic"].setdefault("models_source", "explicit_map")
     settings = claude_settings_read()
-    env = claude_env(settings)
-    previous = claude_current_info()
-    safe_backup = _safe_claude_settings_snapshot(settings)
-    if not data.get("claude_fallback") and not _is_sgate_channel_helper(settings.get("apiKeyHelper")):
-        data["claude_fallback"] = {
-            "settings": _safe_claude_settings_snapshot(previous["settings"]),
-            "has_original_auth": bool(env.get("ANTHROPIC_AUTH_TOKEN") or env.get("ANTHROPIC_API_KEY")),
-            "saved_at": datetime.now(timezone.utc).isoformat(),
-        }
-        original_auth = env.get("ANTHROPIC_AUTH_TOKEN") or env.get("ANTHROPIC_API_KEY")
-        if original_auth:
-            keychain_set(CLAUDE_ORIGINAL_KEY_SLUG, original_auth)
-    for secret_key in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"):
-        env.pop(secret_key, None)
-    env.update({
-        "ANTHROPIC_BASE_URL": str(channel["base_url"]).rstrip("/"),
-        "ANTHROPIC_MODEL": model,
-        "CLAUDE_CODE_EFFORT_LEVEL": effort,
-    })
-    for family in ("FABLE", "OPUS", "SONNET", "HAIKU"):
-        env.pop(f"ANTHROPIC_DEFAULT_{family}_MODEL", None)
-    for family, family_model in claude_model_families(model).items():
-        env[f"ANTHROPIC_DEFAULT_{family.upper()}_MODEL"] = family_model
-    settings["env"] = env
-    settings["model"] = model
-    settings["effortLevel"] = effort
-    settings["apiKeyHelper"] = (
-        f"{shlex.quote(str(SCRIPT_PATH))} claude-token {shlex.quote(slug)}"
-    )
-    settings.setdefault("$schema", "https://json.schemastore.org/claude-code-settings.json")
-    backup = claude_settings_backup(safe_backup)
+    validate_claude_settings_shape(settings)
+    backup = claude_settings_backup(settings)
+    _apply_claude_plan(settings, data, plan)
+    # Persist the journal before replacing settings so recovery never relies on a full snapshot.
+    save_channels(data)
     claude_settings_write(settings)
+    channel["protocols"] = protocols
+    channel["runtimes"] = runtimes
+    anthropic = protocols["anthropic"]
+    runtime = runtimes["claude_code"]
     channel.update({
-        "claude_model": model,
-        "claude_reasoning_effort": effort,
-        "claude_selected_models": models,
-        "claude_selected_efforts": efforts,
+        "claude_base_url": anthropic["base_url"],
+        "claude_models": anthropic["models"],
+        "claude_model_map": runtime["model_map"],
+        "claude_default_role": runtime["default_role"],
+        "claude_effort": runtime["effort"],
+        "claude_auth_mode": anthropic["auth"]["mode"],
         "claude_enabled": True,
         "claude_last_enabled_at": datetime.now(timezone.utc).isoformat(),
     })
     for item in data.get("channels", {}).values():
-        if item is not channel:
+        if item is not channel and isinstance(item, dict):
             item["claude_enabled"] = False
     data["claude_active"] = slug
     save_channels(data)
     print_heading("Claude Code 已启用", f"{channel.get('name', slug)} ({slug})")
-    print_field("Base URL", channel["base_url"])
-    print_field("默认模型", model, tone="accent")
-    print_field("思考强度", effort, tone="accent")
-    print_field("候选模型", f"{len(models)} 个")
-    print_field("候选强度", f"{len(efforts)} 个")
+    print_field("Anthropic URL", anthropic["base_url"])
+    print_field("默认 alias", runtime["default_role"], tone="accent")
+    print_field("思考强度", runtime["effort"], tone="accent")
+    for role in CLAUDE_ROLES:
+        print_field(f"{role} →", runtime["model_map"][role])
     if backup:
-        print_note(f"已备份 Claude Code 配置：{backup}")
+        print_note(f"已写入脱敏备份：{backup}")
     print_note("Claude Code 新会话会读取新配置；运行中的会话请重启。", kind="warn")
 
 
 def deactivate_claude_code_channel(slug: str | None = None, *, quiet: bool = False) -> None:
     data = load_channels()
     active = str(data.get("claude_active") or slug or "")
-    settings = claude_settings_read()
-    helper_managed = _is_sgate_channel_helper(settings.get("apiKeyHelper"))
-    if not active and not helper_managed:
+    state = data.get("runtime_state", {})
+    claude_state = state.get(CLAUDE_TAKEOVER_KEY, {}) if isinstance(state, dict) else {}
+    takeover = claude_state.get("takeover") if isinstance(claude_state, dict) else None
+    if not isinstance(takeover, dict):
+        legacy = data.get("claude_fallback")
         if not quiet:
-            print_note("当前没有由 SGate 管理的 Claude Code 渠道。", kind="warn")
+            if isinstance(legacy, dict):
+                print_note("检测到旧版 Claude 整体快照；来源含义不明确，未自动覆盖当前配置。", kind="warn")
+            else:
+                print_note("当前没有 SGate pointer journal，未修改 Claude Code 配置。", kind="warn")
         return
-    fallback = data.get("claude_fallback") if isinstance(data.get("claude_fallback"), dict) else {}
-    backup = claude_settings_backup(_safe_claude_settings_snapshot(settings))
-    restored = fallback.get("settings") if isinstance(fallback.get("settings"), dict) else None
-    if restored is not None:
-        settings = json.loads(json.dumps(restored, ensure_ascii=False))
-        env = claude_env(settings)
-        if fallback.get("has_original_auth"):
-            env.pop("ANTHROPIC_API_KEY", None)
-            env.pop("ANTHROPIC_AUTH_TOKEN", None)
-            settings["apiKeyHelper"] = f"{shlex.quote(str(SCRIPT_PATH))} claude-token {CLAUDE_ORIGINAL_KEY_SLUG}"
-        settings["env"] = env
+    target_path = str(Path(str(takeover.get("target_path", ""))).expanduser().resolve())
+    current_path = str(CLAUDE_CODE_SETTINGS_PATH.expanduser().resolve())
+    if target_path != current_path:
+        die(f"Claude journal 属于 {target_path}，当前配置是 {current_path}；已停止恢复，未修改配置。")
+    settings = claude_settings_read()
+    validate_claude_settings_shape(settings)
+    backup = claude_settings_backup(settings)
+    settings, conflicts = _restore_claude_takeover(settings, takeover)
+    file_existed = bool(takeover.get("file_existed"))
+    if not file_existed and not settings:
+        try:
+            CLAUDE_CODE_SETTINGS_PATH.unlink()
+        except FileNotFoundError:
+            pass
     else:
-        env = claude_env(settings)
-        for key in (
-            "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "CLAUDE_CODE_EFFORT_LEVEL",
-            "ANTHROPIC_DEFAULT_FABLE_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL",
-            "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL",
-        ):
-            env.pop(key, None)
-        settings["env"] = env
-        if helper_managed:
-            settings.pop("apiKeyHelper", None)
-        settings.pop("model", None)
-        settings.pop("effortLevel", None)
-    claude_settings_write(settings)
+        claude_settings_write(settings)
+        mode = takeover.get("original_mode")
+        if isinstance(mode, int) and file_existed:
+            os.chmod(CLAUDE_CODE_SETTINGS_PATH, mode)
     channel = data.get("channels", {}).get(active)
-    if channel:
+    if isinstance(channel, dict):
         channel["claude_enabled"] = False
         channel["claude_last_disabled_at"] = datetime.now(timezone.utc).isoformat()
     data["claude_active"] = None
-    data.pop("claude_fallback", None)
+    claude_state.pop("takeover", None)
+    if not claude_state and isinstance(state, dict):
+        state.pop(CLAUDE_TAKEOVER_KEY, None)
     save_channels(data)
     if not quiet:
         if backup:
-            print_note(f"已备份 Claude Code 配置：{backup}")
-        print_note("已停用 Claude Code 渠道并恢复停用前配置。", kind="ok")
+            print_note(f"已写入脱敏备份：{backup}")
+        if conflicts:
+            print_note("以下路径已被用户或其他工具修改，SGate 保留现值：" + ", ".join(conflicts), kind="warn")
+        else:
+            print_note("已按 pointer journal 精确恢复 Claude Code 配置。", kind="ok")
         print_note("新会话会读取恢复后的配置；运行中的会话请重启。", kind="warn")
 
 
-def configure_claude_code_channel() -> None:
-    slug = choose_channel("Claude Code：选择渠道", runtime="claude")
+def configure_claude_code_channel(
+    slug: str | None = None, *, anthropic_base_url: str | None = None,
+    model_map: dict[str, str] | None = None, default_role: str | None = None,
+    effort: str | None = None, auth_mode: str | None = None,
+) -> None:
+    slug = slug or choose_channel("Claude Code：选择渠道", runtime="claude")
     if not slug:
         return
-    channel = load_channels()["channels"][slug]
-    models = _normalized_values(channel.get("models")) or claude_provider_models(channel)
-    model_pick = choose_models(
-        models,
-        defaults=claude_provider_models(channel),
-        default_value=_channel_value(channel, "claude", "model") or channel.get("model") or "sonnet",
+    data = load_channels()
+    channel = data.get("channels", {}).get(slug)
+    if not isinstance(channel, dict):
+        die(f"渠道不存在：{slug}")
+    anthropic, runtime = _anthropic_profile_sections(channel)
+    if anthropic_base_url is None:
+        current_url = str(anthropic.get("base_url") or "")
+        anthropic_base_url = input(
+            f"Anthropic Base URL（独立于 OpenAI URL） [{current_url}]："
+        ).strip() or current_url
+    models = _normalized_values(channel.get("models"))
+    if model_map is None:
+        existing_map = runtime.get("model_map") if isinstance(runtime.get("model_map"), dict) else {}
+        selected: dict[str, str] = {}
+        for role in CLAUDE_ROLES:
+            default_model = existing_map.get(role)
+            pick = terminal_radio(
+                f"Claude alias -> 网关模型 ID\n当前 alias：{role}",
+                [(name, name + ("  · 当前" if name == default_model else "")) for name in models],
+                default=default_model,
+                searchable=True,
+            )
+            if pick is None:
+                print_note("已取消，Claude 配置未写入。", kind="warn")
+                return
+            selected[role] = pick
+        model_map = selected
+    if default_role is None:
+        default_role = terminal_radio(
+            "Claude Code 默认 alias",
+            [(role, f"{role} -> {model_map[role]}") for role in CLAUDE_ROLES],
+            default=str(runtime.get("default_role") or "sonnet"),
+        )
+        if default_role is None:
+            print_note("已取消，Claude 配置未写入。", kind="warn")
+            return
+    if effort is None:
+        effort = terminal_radio(
+            "Claude Code 思考强度",
+            [(value, value) for value in CLAUDE_EFFORTS],
+            default=str(runtime.get("effort") or "high"),
+        )
+        if effort is None:
+            print_note("已取消，Claude 配置未写入。", kind="warn")
+            return
+    select_claude_code_channel(
+        slug, anthropic_base_url=anthropic_base_url, model_map=model_map,
+        default_role=default_role, effort=effort, auth_mode=auth_mode,
     )
-    if not model_pick:
-        return
-    selected_models, model = model_pick
-    effort_pick = terminal_multi(
-        "Claude Code：选择思考强度\n  Space 勾选候选；Enter 将光标项设为默认",
-        [(e, e + ("  · 当前默认" if e == _channel_value(channel, "claude", "reasoning_effort") else "")) for e in CLAUDE_EFFORTS],
-        defaults=_normalized_values(_channel_value(channel, "claude", "selected_efforts"), CLAUDE_EFFORTS) or list(CLAUDE_EFFORTS),
-        default_value=_channel_value(channel, "claude", "reasoning_effort") or "high",
-    )
-    if not effort_pick:
-        return
-    selected_efforts, effort = effort_pick
-    select_claude_code_channel(slug, model=model, effort=effort, selected_models=selected_models, selected_efforts=selected_efforts)
 
 
 def print_claude_code_status() -> None:
@@ -1158,14 +1633,26 @@ def print_claude_code_status() -> None:
     print_field("默认模型", info["model"], tone="accent")
     print_field("思考强度", info["effort"], tone="accent")
     print_field("认证状态", "已配置" if info["token_set"] else "未配置", tone="ok" if info["token_set"] else "warn")
-    print_note("Claude Code 支持 low / medium / high / xhigh；max 仅适用于单次会话。", kind="info")
+    print_note("Claude Code 持久配置仅支持 low / medium / high。", kind="info")
+    if channel:
+        _, runtime = _anthropic_profile_sections(channel)
+        model_map = runtime.get("model_map") if isinstance(runtime.get("model_map"), dict) else {}
+        for role in CLAUDE_ROLES:
+            print_field(f"{role} →", model_map.get(role, "未配置"), tone="accent" if role in model_map else "warn")
+    if isinstance(data.get("claude_fallback"), dict):
+        print_note("存在旧版 Claude fallback 快照：其恢复语义为 legacy/ambiguous。", kind="warn")
 
 
 def claude_desktop_status() -> None:
     print_heading("Claude Desktop 当前配置")
     print_field("配置文件", CLAUDE_DESKTOP_CONFIG_PATH)
     print_field("Code tab 配置", CLAUDE_CODE_SETTINGS_PATH)
+    info = claude_current_info()
+    print_field("Code alias", info["model"], tone="accent")
+    print_field("Code effort", info["effort"], tone="accent")
+    print_field("Anthropic URL", info["base_url"])
     print_field("应用", "已安装" if Path("/Applications/Claude.app").exists() else "未检测到", tone="ok" if Path("/Applications/Claude.app").exists() else "warn")
+    print_note("Desktop JSON 只提供受支持的应用/MCP 设置；自定义 provider 与 Bearer-only 持久认证为 unsupported。", kind="warn")
     if not CLAUDE_DESKTOP_CONFIG_PATH.exists():
         print_note("尚未找到 Claude Desktop 配置文件。", kind="warn")
         return
@@ -1176,15 +1663,17 @@ def claude_desktop_status() -> None:
         return
     mcp = config.get("mcpServers", {}) if isinstance(config, dict) else {}
     print_field("MCP 服务", f"{len(mcp)} 个")
-    print_note("Claude Desktop 原生不提供自定义 API Base URL、API Key 或模型 provider 配置。", kind="warn")
-    print_note("Desktop 的 Code tab 使用同一份 Claude Code settings.json，因此 SGate 的 Claude Code 渠道会同步影响 Code tab。", kind="ok")
+    print_note("Claude Desktop 原生不提供自定义 API Base URL、API Key 或模型 provider 配置；Bearer-only 持久认证为 unsupported。", kind="warn")
+    print_note("Desktop 的 Code tab 复用 Claude Code settings.json；Desktop JSON 本身保持只读。", kind="ok")
     print_note("Desktop Chat/Cowork 渠道仍由 Claude Desktop 自身的账户、连接器和扩展设置管理。")
 
 
-def select_claude_desktop_channel(slug: str, *, model: str | None = None, effort: str | None = None) -> None:
-    """Apply a Claude Code channel to Claude Desktop's Code tab."""
-    select_claude_code_channel(slug, model=model, effort=effort)
-    print_note("Claude Desktop 的 Code tab 使用同一份 Claude Code 配置，重启或新建 Code session 后生效。", kind="ok")
+def select_claude_desktop_channel(slug: str, **options: Any) -> None:
+    """Apply the Claude planner to Desktop's Code tab; never edit Desktop JSON."""
+    if options.get("auth_mode") in ("auth_token", "bearer", "plaintext"):
+        die("Claude Desktop 的 bearer-only 持久认证无法安全表达，unsupported；请使用 api_key_helper。")
+    select_claude_code_channel(slug, **options)
+    print_note("Desktop JSON 保持只读；Code tab 在重启或新建 session 后读取 Claude Code 配置。", kind="ok")
 
 
 def claude_desktop_interactive() -> None:
@@ -1584,7 +2073,7 @@ def choose_opencode_channels() -> None:
         tag = green("  [默认]") if slug == active else ("  [已启用]" if slug in enabled else "")
         options.append((slug, f"{channel.get('name', slug)} ({slug}) · {model} · {effort}{tag}"))
     picked = terminal_multi(
-        "OpenCode 多渠道\n  Space 勾选要同时启用的渠道；Enter 将光标项设为默认",
+        "OpenCode 多渠道\n  Space 勾选要同时启用的渠道；d 设默认；Enter 确认",
         options,
         defaults=enabled,
         default_value=active if active in channels else (enabled[0] if enabled else None),
@@ -1708,20 +2197,31 @@ def engine_interactive() -> None:
         try:
             data = load_channels()
             total = len(data.get("channels", {}))
-            codex_info = current_config_info()
-            codex_name = next(
-                (c.get("name", s) for s, c in data.get("channels", {}).items()
-                 if provider_id(s) == codex_info["provider_id"]),
-                "官方登录" if codex_info["provider_id"] == "openai" else codex_info["provider_id"],
-            )
-            oc_enabled = opencode_enabled_slugs()
-            claude_info = claude_current_info()
+            try:
+                codex_info = current_config_info()
+                codex_name = next(
+                    (c.get("name", s) for s, c in data.get("channels", {}).items()
+                     if provider_id(s) == codex_info["provider_id"]),
+                    "官方登录" if codex_info["provider_id"] == "openai" else codex_info["provider_id"],
+                )
+            except SystemExit:
+                codex_info = {"model": "配置不可读"}
+                codex_name = "不可用"
+            try:
+                oc_enabled = opencode_enabled_slugs()
+            except SystemExit:
+                oc_enabled = []
+            try:
+                claude_info = claude_current_info()
+            except SystemExit:
+                claude_info = {"model": "配置不可读"}
             claude_name = data.get("claude_active") or "未启用"
             choice = terminal_menu(
                 "SGate 渠道切换器\n"
-                f"渠道 {total} 个　|　Codex：{codex_name} · {codex_info['model']}"
-                f"　|　OpenCode：{len(oc_enabled)} 个已启用"
-                f"　|　Claude Code：{claude_name} · {claude_info['model']}",
+                f"渠道：{total} 个\n"
+                f"Codex：{codex_name} · {codex_info['model']}\n"
+                f"OpenCode：{len(oc_enabled)} 个已启用\n"
+                f"Claude Code：{claude_name} · {claude_info['model']}",
                 [
                     ("channels", "[渠道管理] 新增、删除、总览和连接检查"),
                     ("codex", "[Codex] 选择渠道、模型、思考强度并启用"),
@@ -1882,7 +2382,7 @@ def choose_models(
     options = [(name, _model_label(name, default_value)) for name in ordered]
     print(f"\n已自动拉取 {len(ordered)} 个可用模型。")
     return terminal_multi(
-        "选择可在 ChatGPT.app 中切换的模型\n  可勾选多个；按 Enter 时光标项成为默认模型",
+        "选择可在 ChatGPT.app 中切换的模型\n  Space 勾选；d 设默认；Enter 确认",
         options,
         defaults=defaults,
         default_value=default_value,
@@ -1913,7 +2413,7 @@ def choose_efforts(
     labels = _effort_labels()
     current = default_value if default_value in EFFORTS else DEFAULT_EFFORT
     return terminal_multi(
-        "选择可在 ChatGPT.app 中切换的推理强度\n  可勾选多个；按 Enter 时光标项成为默认强度",
+        "选择可在 ChatGPT.app 中切换的推理强度\n  Space 勾选；d 设默认；Enter 确认",
         [(effort, labels[effort] + ("  [当前默认]" if effort == current else "")) for effort in EFFORTS],
         defaults=defaults,
         default_value=current,
@@ -1985,6 +2485,17 @@ def _channel_value(channel: dict[str, Any], runtime: str, name: str, legacy_name
     key = f"{runtime}_{name}"
     if key in channel:
         return channel[key]
+    if runtime == "claude":
+        _, claude_runtime = _anthropic_profile_sections(channel)
+        if name in ("model", "default_role"):
+            role = str(claude_runtime.get("default_role") or channel.get("claude_default_role") or "")
+            model_map = claude_runtime.get("model_map")
+            if name == "default_role":
+                return role or None
+            if isinstance(model_map, dict) and role in model_map:
+                return model_map[role]
+        if name in ("reasoning_effort", "effort"):
+            return claude_runtime.get("effort") or channel.get("claude_effort")
     return channel.get(legacy_name or name)
 
 
@@ -2590,17 +3101,19 @@ def list_channels() -> None:
     print()
     claude_rows = []
     for slug, channel in channels.items():
-        claude_model = _channel_value(channel, "claude", "model") or "(未选)"
-        claude_effort = _channel_value(channel, "claude", "reasoning_effort") or "high"
+        _, claude_runtime = _anthropic_profile_sections(channel)
+        claude_map = claude_runtime.get("model_map") if isinstance(claude_runtime.get("model_map"), dict) else {}
+        claude_effort = str(claude_runtime.get("effort") or "(未选)")
+        mapping_text = ", ".join(f"{role}→{claude_map.get(role, '?')}" for role in CLAUDE_ROLES)
         is_active = slug == claude_active
         claude_rows.append([
             channel.get("name", slug),
             slug,
             green(f"{ICON_ON} 当前") if is_active else dim(f"{ICON_OFF} 未用"),
-            f"{claude_model}/{claude_effort}",
+            f"{mapping_text} / {claude_effort}",
         ])
     print_heading("Claude Code 渠道", f"当前：{claude_active or '未启用'}")
-    print_table(["名称", "slug", "状态", "模型/强度"], claude_rows)
+    print_table(["名称", "slug", "状态", "alias → 网关模型 / effort"], claude_rows)
     print_note("Claude Desktop 不提供自定义 API provider；请通过 Desktop 账户、Code tab 和 MCP 设置管理。")
 
 
@@ -2930,17 +3443,30 @@ def build_parser() -> argparse.ArgumentParser:
     p_oc.add_argument("--reasoning", choices=EFFORTS)
     p_oc.add_argument("--default", dest="default_slug", help="sync 时指定默认渠道")
 
-    p_cc = sub.add_parser("claude-code", help="切换 Claude Code 渠道、模型和思考强度")
-    p_cc.add_argument("action", nargs="?", choices=("use", "configure", "disable", "status"), default=None)
-    p_cc.add_argument("slug", nargs="?")
-    p_cc.add_argument("--model")
-    p_cc.add_argument("--effort", choices=CLAUDE_EFFORTS)
+    def add_claude_arguments(command: argparse.ArgumentParser) -> None:
+        command.add_argument("slug", nargs="?")
+        command.add_argument("--anthropic-base-url", help="独立 Anthropic API Base URL")
+        command.add_argument(
+            "--map", dest="model_maps", action="append", default=[], metavar="ROLE=MODEL",
+            help="显式 alias 映射，可重复：opus=... / sonnet=... / haiku=...",
+        )
+        command.add_argument("--map-all", metavar="MODEL", help="将同一模型显式映射到三个 alias")
+        command.add_argument("--model", help="兼容参数，等同 --map-all 并打印提示")
+        command.add_argument("--default-role", choices=CLAUDE_ROLES)
+        command.add_argument("--effort", choices=CLAUDE_EFFORTS)
+        command.add_argument(
+            "--auth-mode", default=None,
+            choices=("api_key_helper", "auth_token", "api_key", "bearer", "plaintext"),
+            help="持久配置仅支持 api_key_helper；其他模式会明确拒绝",
+        )
 
-    p_cd = sub.add_parser("claude-desktop", help="切换 Claude Desktop Code tab 渠道或查看 MCP 状态")
-    p_cd.add_argument("action", nargs="?", choices=("use", "disable", "status"), default=None)
-    p_cd.add_argument("slug", nargs="?")
-    p_cd.add_argument("--model")
-    p_cd.add_argument("--effort", choices=CLAUDE_EFFORTS)
+    p_cc = sub.add_parser("claude-code", help="切换 Claude Code Anthropic 渠道与 alias 映射")
+    p_cc.add_argument("action", nargs="?", choices=("use", "configure", "config", "disable", "status"), default=None)
+    add_claude_arguments(p_cc)
+
+    p_cd = sub.add_parser("claude-desktop", help="配置 Desktop Code tab 或只读查看 MCP 状态")
+    p_cd.add_argument("action", nargs="?", choices=("use", "configure", "config", "disable", "status"), default=None)
+    add_claude_arguments(p_cd)
 
     p_token = sub.add_parser("token", help=argparse.SUPPRESS)
     p_token.add_argument("slug")
@@ -3010,28 +3536,35 @@ def main() -> None:
             configure_opencode_channel()
         else:
             opencode_interactive()
-    elif args.command == "claude-code":
+    elif args.command in ("claude-code", "claude-desktop"):
+        model_map = _parse_model_map(args.model_maps, args.map_all)
+        if args.model:
+            if model_map:
+                die("--model 与 --map/--map-all 不能同时使用")
+            print_note("--model 是兼容参数，本次会显式 map-all 到 opus/sonnet/haiku。", kind="warn")
+            model_map = {role: args.model for role in CLAUDE_ROLES}
+        options = {
+            "anthropic_base_url": args.anthropic_base_url,
+            "model_map": model_map,
+            "default_role": args.default_role,
+            "effort": args.effort,
+            "auth_mode": args.auth_mode,
+        }
         if args.action == "status":
-            print_claude_code_status()
+            print_claude_code_status() if args.command == "claude-code" else claude_desktop_status()
         elif args.action == "use":
             if not args.slug:
-                die("Claude Code use 需要渠道 slug")
-            select_claude_code_channel(args.slug, model=args.model, effort=args.effort)
-        elif args.action == "configure":
-            configure_claude_code_channel()
+                die(f"{'Claude Code' if args.command == 'claude-code' else 'Claude Desktop'} use 需要渠道 slug")
+            if args.command == "claude-code":
+                select_claude_code_channel(args.slug, **options)
+            else:
+                select_claude_desktop_channel(args.slug, **options)
+        elif args.action in ("configure", "config"):
+            configure_claude_code_channel(args.slug, **options)
         elif args.action == "disable":
             deactivate_claude_code_channel(args.slug)
-        else:
+        elif args.command == "claude-code":
             claude_code_interactive()
-    elif args.command == "claude-desktop":
-        if args.action == "use":
-            if not args.slug:
-                die("Claude Desktop use 需要渠道 slug")
-            select_claude_desktop_channel(args.slug, model=args.model, effort=args.effort)
-        elif args.action == "disable":
-            deactivate_claude_code_channel(args.slug)
-        elif args.action == "status":
-            claude_desktop_status()
         else:
             claude_desktop_interactive()
     elif args.command == "token":

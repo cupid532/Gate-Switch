@@ -327,57 +327,169 @@ class SGateTests(unittest.TestCase):
         self.assertEqual(updated["opencode_selected_models"], ["open-model-2"])
         self.assertEqual(updated["opencode_model"], "open-model-2")
 
-    def test_claude_code_writes_settings_without_plaintext_token(self) -> None:
+    def test_claude_planner_requires_complete_explicit_role_map(self) -> None:
+        profile = {
+            "slug": "test",
+            "protocols": {"anthropic": {"base_url": "https://anthropic.example"}},
+            "runtimes": {"claude_code": {"default_role": "sonnet", "effort": "high", "model_map": {
+                "opus": "gw-opus", "sonnet": "gw-sonnet", "haiku": "gw-haiku"
+            }}},
+        }
+        plan = sgate.compile_claude_managed_values(profile)
+        self.assertTrue(plan.supported)
+        self.assertEqual(plan.desired["/model"], "sonnet")
+        self.assertEqual(plan.desired["/env/ANTHROPIC_DEFAULT_OPUS_MODEL"], "gw-opus")
+        self.assertNotIn("/env/ANTHROPIC_MODEL", plan.desired)
+        profile["runtimes"]["claude_code"]["model_map"].pop("haiku")
+        self.assertFalse(sgate.compile_claude_managed_values(profile).supported)
+
+    def test_claude_code_writes_independent_anthropic_role_map(self) -> None:
         original = {
             "permissions": {"allow": ["Bash(pwd)"]},
-            "env": {
-                "ANTHROPIC_AUTH_TOKEN": "old-secret",
-                "KEEP_ME": "yes",
-            },
+            "hooks": {"Stop": ["keep"]},
+            "env": {"ANTHROPIC_AUTH_TOKEN": "old-secret", "KEEP_ME": "yes"},
             "model": "old-model",
         }
         sgate.CLAUDE_CODE_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
         sgate.CLAUDE_CODE_SETTINGS_PATH.write_text(json.dumps(original), encoding="utf-8")
         with patch.object(sgate, "keychain_set") as save_key:
             sgate.select_claude_code_channel(
-                "test",
-                model="claude-sonnet-5",
-                effort="xhigh",
-                selected_models=["claude-sonnet-5", "claude-opus-5"],
-                selected_efforts=["high", "xhigh"],
+                "test", anthropic_base_url="https://anthropic.example", default_role="opus", effort="high",
+                model_map={"opus": "gw-opus", "sonnet": "gw-sonnet", "haiku": "gw-haiku"},
             )
         save_key.assert_called_once_with(sgate.CLAUDE_ORIGINAL_KEY_SLUG, "old-secret")
         settings = json.loads(sgate.CLAUDE_CODE_SETTINGS_PATH.read_text(encoding="utf-8"))
         env = settings["env"]
         self.assertEqual(settings["permissions"], original["permissions"])
+        self.assertEqual(settings["hooks"], original["hooks"])
         self.assertEqual(env["KEEP_ME"], "yes")
         self.assertNotIn("ANTHROPIC_AUTH_TOKEN", env)
-        self.assertNotIn("ANTHROPIC_API_KEY", env)
-        self.assertIn("claude-token", settings["apiKeyHelper"])
-        self.assertEqual(settings["model"], "claude-sonnet-5")
-        self.assertEqual(settings["effortLevel"], "xhigh")
-        self.assertEqual(env["ANTHROPIC_BASE_URL"], "https://new.example/v1")
-        self.assertEqual(env["CLAUDE_CODE_EFFORT_LEVEL"], "xhigh")
-        self.assertEqual(sgate.keychain_get("test"), "secret-for-test")
-        backups = list(sgate.CLAUDE_BACKUP_DIR.glob("settings.json.sgate-*.bak"))
-        self.assertEqual(len(backups), 1)
-        self.assertNotIn("old-secret", backups[0].read_text(encoding="utf-8"))
+        self.assertNotIn("ANTHROPIC_MODEL", env)
+        self.assertNotIn("CLAUDE_CODE_EFFORT_LEVEL", env)
+        self.assertEqual(settings["model"], "opus")
+        self.assertEqual(settings["effortLevel"], "high")
+        self.assertEqual(env["ANTHROPIC_BASE_URL"], "https://anthropic.example")
+        self.assertEqual(env["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "gw-haiku")
+        data = json.loads(sgate.CHANNELS_PATH.read_text(encoding="utf-8"))
+        entry = data["runtime_state"]["claude_code"]["takeover"]["entries"]
+        auth_entry = next(item for item in entry if item["path"] == "/env/ANTHROPIC_AUTH_TOKEN")
+        self.assertNotIn("old-secret", json.dumps(data))
+        self.assertEqual(auth_entry["before"], {"keychain_restore_ref": sgate.CLAUDE_ORIGINAL_KEY_SLUG})
 
-    def test_claude_code_disable_restores_settings(self) -> None:
-        original = {
-            "env": {"ANTHROPIC_AUTH_TOKEN": "original-secret", "KEEP_ME": "yes"},
-            "model": "sonnet",
-        }
+    def test_claude_code_disable_restores_settings_and_preserves_changes(self) -> None:
+        original = {"env": {"ANTHROPIC_AUTH_TOKEN": "original-secret", "KEEP_ME": "yes"}, "model": "sonnet"}
         sgate.CLAUDE_CODE_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
         sgate.CLAUDE_CODE_SETTINGS_PATH.write_text(json.dumps(original), encoding="utf-8")
-        with patch.object(sgate, "keychain_set") as save_key:
-            sgate.select_claude_code_channel("test", model="claude-sonnet-5", effort="high")
-        save_key.assert_called_once_with(sgate.CLAUDE_ORIGINAL_KEY_SLUG, "original-secret")
-        sgate.deactivate_claude_code_channel("test")
+        with patch.object(sgate, "keychain_set"), patch.object(sgate, "keychain_get", return_value="original-secret"):
+            sgate.select_claude_code_channel(
+                "test", anthropic_base_url="https://anthropic.example", default_role="sonnet", effort="high",
+                model_map={"opus": "gw-opus", "sonnet": "gw-sonnet", "haiku": "gw-haiku"},
+            )
+            sgate.deactivate_claude_code_channel("test")
         restored = json.loads(sgate.CLAUDE_CODE_SETTINGS_PATH.read_text(encoding="utf-8"))
         self.assertEqual(restored["model"], "sonnet")
         self.assertEqual(restored["env"]["KEEP_ME"], "yes")
-        self.assertIn("claude-token", restored["apiKeyHelper"])
+        self.assertEqual(restored["env"]["ANTHROPIC_AUTH_TOKEN"], "original-secret")
+
+    def test_claude_map_all_and_cli_parser(self) -> None:
+        self.assertEqual(sgate._parse_model_map([], "same"), {role: "same" for role in sgate.CLAUDE_ROLES})
+        args = sgate.build_parser().parse_args([
+            "claude-code", "use", "test", "--anthropic-base-url", "https://a.example",
+            "--map", "opus=o", "--map", "sonnet=s", "--map", "haiku=h", "--default-role", "haiku", "--effort", "low",
+        ])
+        self.assertEqual(args.slug, "test")
+        self.assertEqual(args.model_maps, ["opus=o", "sonnet=s", "haiku=h"])
+        self.assertEqual(args.effort, "low")
+
+    def test_legacy_claude_fields_migrate_without_guessing(self) -> None:
+        data = json.loads(sgate.CHANNELS_PATH.read_text(encoding="utf-8"))
+        data["channels"]["test"].update({
+            "claude_model": "legacy-sonnet",
+            "claude_selected_models": ["legacy-sonnet"],
+            "claude_reasoning_effort": "xhigh",
+        })
+        sgate.save_channels(data)
+        migrated = sgate.load_channels()["channels"]["test"]
+        anthropic = migrated["protocols"]["anthropic"]
+        self.assertEqual(anthropic["migration_status"], "needs_configuration")
+        self.assertEqual(anthropic["legacy_hint"]["claude_model"], "legacy-sonnet")
+        self.assertNotIn("base_url", anthropic)
+        self.assertNotIn("models", anthropic)
+        self.assertNotIn("runtimes", migrated)
+
+    def test_claude_disable_preserves_conflicting_local_edit(self) -> None:
+        original = {"model": "old", "env": {"KEEP": "yes"}}
+        sgate.CLAUDE_CODE_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        sgate.CLAUDE_CODE_SETTINGS_PATH.write_text(json.dumps(original), encoding="utf-8")
+        sgate.select_claude_code_channel(
+            "test", anthropic_base_url="https://anthropic.example", default_role="sonnet", effort="high",
+            model_map={"opus": "o", "sonnet": "s", "haiku": "h"},
+        )
+        local = json.loads(sgate.CLAUDE_CODE_SETTINGS_PATH.read_text(encoding="utf-8"))
+        local["model"] = "user-choice"
+        local["permissions"] = {"allow": ["Bash(pwd)"]}
+        sgate.CLAUDE_CODE_SETTINGS_PATH.write_text(json.dumps(local), encoding="utf-8")
+        sgate.deactivate_claude_code_channel("test")
+        restored = json.loads(sgate.CLAUDE_CODE_SETTINGS_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(restored["model"], "user-choice")
+        self.assertEqual(restored["permissions"], local["permissions"])
+        self.assertEqual(restored["env"], {"KEEP": "yes"})
+
+    def test_claude_switch_keeps_first_before_value(self) -> None:
+        sgate.CLAUDE_CODE_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        sgate.CLAUDE_CODE_SETTINGS_PATH.write_text(json.dumps({"model": "before"}), encoding="utf-8")
+        model_map = {"opus": "o", "sonnet": "s", "haiku": "h"}
+        sgate.select_claude_code_channel(
+            "test", anthropic_base_url="https://a.example", default_role="sonnet", effort="high", model_map=model_map,
+        )
+        sgate.select_claude_code_channel(
+            "second", anthropic_base_url="https://b.example", default_role="opus", effort="low", model_map=model_map,
+        )
+        data = json.loads(sgate.CHANNELS_PATH.read_text(encoding="utf-8"))
+        entries = data["runtime_state"]["claude_code"]["takeover"]["entries"]
+        model_entry = next(item for item in entries if item["path"] == "/model")
+        self.assertEqual(model_entry["before"], "before")
+        self.assertEqual(model_entry["applied"], "opus")
+        sgate.deactivate_claude_code_channel("second")
+        restored = json.loads(sgate.CLAUDE_CODE_SETTINGS_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(restored["model"], "before")
+
+    def test_claude_disable_restores_file_existence_and_empty_env(self) -> None:
+        model_map = {"opus": "o", "sonnet": "s", "haiku": "h"}
+        sgate.select_claude_code_channel(
+            "test", anthropic_base_url="https://a.example", default_role="sonnet", effort="high", model_map=model_map,
+        )
+        sgate.deactivate_claude_code_channel("test")
+        self.assertFalse(sgate.CLAUDE_CODE_SETTINGS_PATH.exists())
+
+        sgate.CLAUDE_CODE_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        sgate.CLAUDE_CODE_SETTINGS_PATH.write_text(json.dumps({"env": {}}), encoding="utf-8")
+        sgate.select_claude_code_channel(
+            "test", anthropic_base_url="https://a.example", default_role="sonnet", effort="high", model_map=model_map,
+        )
+        sgate.deactivate_claude_code_channel("test")
+        self.assertEqual(json.loads(sgate.CLAUDE_CODE_SETTINGS_PATH.read_text(encoding="utf-8")), {"env": {}})
+
+    def test_claude_env_wrong_shape_fails_closed(self) -> None:
+        for invalid in ("not-an-object", ["bad"], None):
+            sgate.CLAUDE_CODE_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            sgate.CLAUDE_CODE_SETTINGS_PATH.write_text(json.dumps({"env": invalid}), encoding="utf-8")
+            before = sgate.CLAUDE_CODE_SETTINGS_PATH.read_text(encoding="utf-8")
+            with self.assertRaises(SystemExit):
+                sgate.select_claude_code_channel(
+                    "test", anthropic_base_url="https://a.example", default_role="sonnet", effort="high",
+                    model_map={"opus": "o", "sonnet": "s", "haiku": "h"},
+                )
+            self.assertEqual(sgate.CLAUDE_CODE_SETTINGS_PATH.read_text(encoding="utf-8"), before)
+
+    def test_claude_desktop_use_never_rewrites_desktop_json(self) -> None:
+        original = {"mcpServers": {"demo": {"command": "demo"}}, "other": True}
+        sgate.CLAUDE_DESKTOP_CONFIG_PATH.write_text(json.dumps(original), encoding="utf-8")
+        sgate.select_claude_desktop_channel(
+            "test", anthropic_base_url="https://a.example", default_role="haiku", effort="medium",
+            model_map={"opus": "o", "sonnet": "s", "haiku": "h"},
+        )
+        self.assertEqual(json.loads(sgate.CLAUDE_DESKTOP_CONFIG_PATH.read_text(encoding="utf-8")), original)
 
     def test_claude_desktop_status_reads_mcp_without_rewriting_config(self) -> None:
         original = {"deploymentMode": "3p", "mcpServers": {"demo": {"command": ["demo"]}}}
