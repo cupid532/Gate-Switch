@@ -253,7 +253,8 @@ class SGateTests(unittest.TestCase):
         config = json.loads(sgate.OPENCODE_CONFIG_PATH.read_text(encoding="utf-8"))
         self.assertNotIn("sgate_test", config.get("provider", {}))
         self.assertIn("sgate_second", config["provider"])
-        self.assertEqual(config["model"], "sgate_second/s-model-2")
+        # sync reuses each channel's own saved default model.
+        self.assertEqual(config["model"], "sgate_second/s-model-1")
         self.assertEqual(sgate.opencode_enabled_slugs(), ["second"])
 
     def test_disabling_default_promotes_remaining_channel(self) -> None:

@@ -60,7 +60,7 @@ sgate
 # SGate
 # ├─ 渠道管理：新增 / 删除 / 总览 / 检查
 # ├─ Codex：选择渠道、模型、推理强度并启用
-# └─ OpenCode：选择渠道、模型、推理强度并启用
+# └─ OpenCode：多渠道启用 / 默认渠道 / 模型 / 推理强度
 
 # 直接打开外层渠道管理菜单
 sgate channels
@@ -133,6 +133,8 @@ sgate remove <slug>
 - OpenCode 运行时密钥：`~/.config/opencode/.sgate/<channel>-api-key`
 
 ChatGPT.app 和 OpenCode 都不会让已经运行的会话热切换配置。切换后请重启对应工具；Codex 交互模式仍会按原逻辑处理 ChatGPT.app，OpenCode 切换完成后会明确提示重启。
+
+Codex 一次只能有一个生效 provider，因此 Codex 渠道是单选。OpenCode 的 `provider` 是一个映射，可以同时保留多个渠道，`model` 只决定默认值；所以 OpenCode 支持多渠道并存，启用新渠道不会移除已有渠道。停用默认渠道时，若仍有其他已启用渠道，会自动提升其中一个为默认；若已无渠道，则恢复 SGate 接管前的原始默认配置。
 
 为了兼容旧版 `codex-channel`，SGate 会继续读取原来的渠道文件、Keychain 服务名以及旧备份，不需要重新录入 API Key。
 

@@ -133,7 +133,7 @@ def print_heading(title: str, subtitle: str = "") -> None:
     print(rule())
 
 
-def print_field(label: str, value: Any, *, indent: int = 2, label_width: int = 16,
+def print_field(label: str, value: Any, *, indent: int = 2, label_width: int = 14,
                 tone: str = "") -> None:
     text = str(value)
     if tone == "ok":
@@ -165,10 +165,10 @@ def print_table(headers: list[str], rows: list[list[str]], *, indent: int = 2) -
         for i, cell in enumerate(row):
             widths[i] = max(widths[i], display_width(cell))
     prefix = " " * indent
-    print(prefix + "  ".join(dim(bold(pad(h, widths[i]))) for i, h in enumerate(headers)))
-    print(prefix + dim("  ".join("─" * widths[i] for i in range(len(headers)))))
+    print(prefix + "  ".join(dim(bold(pad(h, widths[i]))) for i, h in enumerate(headers)).rstrip())
+    print(prefix + dim("─" * (sum(widths) + 2 * (len(widths) - 1))))
     for row in rows:
-        print(prefix + "  ".join(pad(cell, widths[i]) for i, cell in enumerate(row)))
+        print(prefix + "  ".join(pad(cell, widths[i]) for i, cell in enumerate(row)).rstrip())
 
 
 def die(message: str, code: int = 1) -> None:
