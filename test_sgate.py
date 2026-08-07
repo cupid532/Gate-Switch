@@ -25,6 +25,10 @@ class SGateTests(unittest.TestCase):
             "CHANNELS_PATH": sgate.CHANNELS_PATH,
             "OPENCODE_CONFIG_PATH": sgate.OPENCODE_CONFIG_PATH,
             "OPENCODE_CREDENTIALS_DIR": sgate.OPENCODE_CREDENTIALS_DIR,
+            "CLAUDE_HOME": sgate.CLAUDE_HOME,
+            "CLAUDE_CODE_SETTINGS_PATH": sgate.CLAUDE_CODE_SETTINGS_PATH,
+            "CLAUDE_DESKTOP_CONFIG_PATH": sgate.CLAUDE_DESKTOP_CONFIG_PATH,
+            "CLAUDE_BACKUP_DIR": sgate.CLAUDE_BACKUP_DIR,
             "keychain_get": sgate.keychain_get,
             "keychain_set": sgate.keychain_set,
             "fetch_models": sgate.fetch_models,
@@ -36,6 +40,10 @@ class SGateTests(unittest.TestCase):
         sgate.CHANNELS_PATH = root / "codex-channels.json"
         sgate.OPENCODE_CONFIG_PATH = root / "opencode.json"
         sgate.OPENCODE_CREDENTIALS_DIR = root / ".sgate"
+        sgate.CLAUDE_HOME = root / ".claude"
+        sgate.CLAUDE_CODE_SETTINGS_PATH = sgate.CLAUDE_HOME / "settings.json"
+        sgate.CLAUDE_DESKTOP_CONFIG_PATH = root / "claude_desktop_config.json"
+        sgate.CLAUDE_BACKUP_DIR = sgate.CLAUDE_HOME / "sgate-backups"
         sgate.keychain_get = lambda slug: f"secret-for-{slug}"
         sgate.chatgpt_is_running = lambda: False
         sgate.ccswitch_is_running = lambda: False
@@ -318,6 +326,71 @@ class SGateTests(unittest.TestCase):
         self.assertEqual(updated["model"], "codex-model")
         self.assertEqual(updated["opencode_selected_models"], ["open-model-2"])
         self.assertEqual(updated["opencode_model"], "open-model-2")
+
+    def test_claude_code_writes_settings_without_plaintext_token(self) -> None:
+        original = {
+            "permissions": {"allow": ["Bash(pwd)"]},
+            "env": {
+                "ANTHROPIC_AUTH_TOKEN": "old-secret",
+                "KEEP_ME": "yes",
+            },
+            "model": "old-model",
+        }
+        sgate.CLAUDE_CODE_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        sgate.CLAUDE_CODE_SETTINGS_PATH.write_text(json.dumps(original), encoding="utf-8")
+        with patch.object(sgate, "keychain_set") as save_key:
+            sgate.select_claude_code_channel(
+                "test",
+                model="claude-sonnet-5",
+                effort="xhigh",
+                selected_models=["claude-sonnet-5", "claude-opus-5"],
+                selected_efforts=["high", "xhigh"],
+            )
+        save_key.assert_called_once_with(sgate.CLAUDE_ORIGINAL_KEY_SLUG, "old-secret")
+        settings = json.loads(sgate.CLAUDE_CODE_SETTINGS_PATH.read_text(encoding="utf-8"))
+        env = settings["env"]
+        self.assertEqual(settings["permissions"], original["permissions"])
+        self.assertEqual(env["KEEP_ME"], "yes")
+        self.assertNotIn("ANTHROPIC_AUTH_TOKEN", env)
+        self.assertNotIn("ANTHROPIC_API_KEY", env)
+        self.assertIn("claude-token", settings["apiKeyHelper"])
+        self.assertEqual(settings["model"], "claude-sonnet-5")
+        self.assertEqual(settings["effortLevel"], "xhigh")
+        self.assertEqual(env["ANTHROPIC_BASE_URL"], "https://new.example/v1")
+        self.assertEqual(env["CLAUDE_CODE_EFFORT_LEVEL"], "xhigh")
+        self.assertEqual(sgate.keychain_get("test"), "secret-for-test")
+        backups = list(sgate.CLAUDE_BACKUP_DIR.glob("settings.json.sgate-*.bak"))
+        self.assertEqual(len(backups), 1)
+        self.assertNotIn("old-secret", backups[0].read_text(encoding="utf-8"))
+
+    def test_claude_code_disable_restores_settings(self) -> None:
+        original = {
+            "env": {"ANTHROPIC_AUTH_TOKEN": "original-secret", "KEEP_ME": "yes"},
+            "model": "sonnet",
+        }
+        sgate.CLAUDE_CODE_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        sgate.CLAUDE_CODE_SETTINGS_PATH.write_text(json.dumps(original), encoding="utf-8")
+        with patch.object(sgate, "keychain_set") as save_key:
+            sgate.select_claude_code_channel("test", model="claude-sonnet-5", effort="high")
+        save_key.assert_called_once_with(sgate.CLAUDE_ORIGINAL_KEY_SLUG, "original-secret")
+        sgate.deactivate_claude_code_channel("test")
+        restored = json.loads(sgate.CLAUDE_CODE_SETTINGS_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(restored["model"], "sonnet")
+        self.assertEqual(restored["env"]["KEEP_ME"], "yes")
+        self.assertIn("claude-token", restored["apiKeyHelper"])
+
+    def test_claude_desktop_status_reads_mcp_without_rewriting_config(self) -> None:
+        original = {"deploymentMode": "3p", "mcpServers": {"demo": {"command": ["demo"]}}}
+        sgate.CLAUDE_DESKTOP_CONFIG_PATH.write_text(json.dumps(original), encoding="utf-8")
+        with patch("builtins.print") as output:
+            sgate.claude_desktop_status()
+        self.assertEqual(
+            json.loads(sgate.CLAUDE_DESKTOP_CONFIG_PATH.read_text(encoding="utf-8")),
+            original,
+        )
+        rendered = " ".join(str(call.args[0]) for call in output.call_args_list if call.args)
+        self.assertIn("MCP", rendered)
+        self.assertIn("不提供自定义 API", rendered)
 
 
 if __name__ == "__main__":

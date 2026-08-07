@@ -1,6 +1,6 @@
 # Gate Switch（`sgate`）
 
-`sgate` 是一个面向 macOS 的 Codex / OpenCode / ChatGPT.app 渠道切换脚本。它可以保存多个 OpenAI 兼容渠道，自动拉取模型，并通过终端复选界面配置模型与推理强度。
+`sgate` 是一个面向 macOS 的 Codex / OpenCode / Claude Code / Claude Desktop Code tab / ChatGPT.app 渠道切换脚本。它可以保存多个兼容渠道，自动拉取模型，并通过终端复选界面配置模型与推理强度。
 
 ## 快速安装
 
@@ -40,6 +40,8 @@ sgate
 - OpenCode 使用合法的 `provider`、`model` 和 `agent.build.variant` 配置，保留 `minimal`、`low`、`medium`、`high`、`xhigh` 思考强度。
 - 状态、总览、连接检查均为带颜色的分栏表格输出；管道输出、`NO_COLOR` 或非 TTY 环境自动降级为纯文本。
 - OpenCode API Key 仍以 macOS Keychain 为密钥源；运行 OpenCode 时写入每渠道独立、权限为 `0600` 的临时引用文件，并通过 `{file:...}` 引用，不写入 `opencode.json`。
+- Claude Code API Key 通过 macOS Keychain 和 `apiKeyHelper` 动态读取，不写入 `~/.claude/settings.json`；支持 `low`、`medium`、`high`、`xhigh` 思考强度。
+- Claude Desktop 的 Code tab 使用同一套 Claude Code 配置，因此可通过 SGate 切换 Code tab 的渠道、模型和思考强度；Desktop Chat/Cowork 的账户和连接器保持由官方应用管理。
 
 ## 交互按键
 
@@ -60,7 +62,9 @@ sgate
 # SGate
 # ├─ 渠道管理：新增 / 删除 / 总览 / 检查
 # ├─ Codex：选择渠道、模型、推理强度并启用
-# └─ OpenCode：多渠道启用 / 默认渠道 / 模型 / 推理强度
+# ├─ OpenCode：多渠道启用 / 默认渠道 / 模型 / 推理强度
+# ├─ Claude Code：渠道 / 模型 / 思考强度
+# └─ Claude Desktop：Code tab 渠道 / MCP 状态
 
 # 直接打开外层渠道管理菜单
 sgate channels
@@ -82,6 +86,24 @@ sgate opencode disable congee
 
 # 查看 OpenCode 当前实际配置（含多渠道列表）
 sgate opencode status
+
+# 打开 Claude Code 渠道菜单
+sgate claude-code
+
+# 直接切换 Claude Code 渠道、模型和思考强度
+sgate claude-code use fusiongate --model claude-sonnet-5 --effort xhigh
+
+# 查看 Claude Code 当前配置
+sgate claude-code status
+
+# 打开 Claude Desktop 菜单，切换其 Code tab 或查看 MCP 状态
+sgate claude-desktop
+
+# 直接切换 Claude Desktop Code tab 的后端
+sgate claude-desktop use fusiongate --model claude-opus-5 --effort high
+
+# 查看 Claude Desktop 配置和 MCP 状态
+sgate claude-desktop status
 
 # 查看实际配置和已保存渠道
 sgate status
@@ -131,10 +153,15 @@ sgate remove <slug>
 - 配置备份：`~/.codex/config.toml.sgate-*.bak`
 - OpenCode 配置：`~/.config/opencode/opencode.json`（可由 `OPENCODE_CONFIG` 覆盖）
 - OpenCode 运行时密钥：`~/.config/opencode/.sgate/<channel>-api-key`
+- Claude Code 配置：`~/.claude/settings.json`（可由 `CLAUDE_CODE_SETTINGS` 覆盖）
+- Claude Code 配置备份：`~/.claude/sgate-backups/settings.json.sgate-*.bak`
+- Claude Desktop 配置：`~/Library/Application Support/Claude/claude_desktop_config.json`（可由 `CLAUDE_DESKTOP_CONFIG` 覆盖）
 
 ChatGPT.app 和 OpenCode 都不会让已经运行的会话热切换配置。切换后请重启对应工具；Codex 交互模式仍会按原逻辑处理 ChatGPT.app，OpenCode 切换完成后会明确提示重启。
 
 Codex 一次只能有一个生效 provider，因此 Codex 渠道是单选。OpenCode 的 `provider` 是一个映射，可以同时保留多个渠道，`model` 只决定默认值；所以 OpenCode 支持多渠道并存，启用新渠道不会移除已有渠道。停用默认渠道时，若仍有其他已启用渠道，会自动提升其中一个为默认；若已无渠道，则恢复 SGate 接管前的原始默认配置。
+
+Claude Code 的渠道切换会更新 `ANTHROPIC_BASE_URL`、`model`、`effortLevel` 和模型族默认值，并通过 `apiKeyHelper` 从 Keychain 读取当前渠道密钥。模型候选仍由 SGate 的交互选择器管理，不写入 Claude Code 不适用的用户级 allowlist。Claude Code 与 Claude Desktop 的 Code tab 读取这套配置；Claude Desktop 的 Chat/Cowork 本身不提供自定义 API provider 字段，SGate 不会写入不受支持的配置。
 
 为了兼容旧版 `codex-channel`，SGate 会继续读取原来的渠道文件、Keychain 服务名以及旧备份，不需要重新录入 API Key。
 

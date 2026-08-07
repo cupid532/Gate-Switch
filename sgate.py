@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""SGate: interactive global Codex channel switcher for macOS.
+"""SGate: interactive global AI coding-tool channel switcher for macOS.
 
 - API keys live in macOS Keychain, never in config.toml or shell arguments.
 - config.toml keeps the active provider/model/reasoning settings used by both
   the standalone Codex CLI and the Codex binary bundled with ChatGPT.app.
+- Claude Code uses ~/.claude/settings.json. Claude Desktop does not expose a
+  custom model/API-provider setting, so SGate reports its supported surface
+  instead of writing unsupported fields into its config.
 """
 from __future__ import annotations
 
@@ -13,6 +16,7 @@ import json
 import os
 import re
 import select
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -39,6 +43,16 @@ OPENCODE_CONFIG_PATH = Path(os.environ.get(
     "OPENCODE_CONFIG", Path.home() / ".config" / "opencode" / "opencode.json"
 )).expanduser()
 OPENCODE_CREDENTIALS_DIR = OPENCODE_CONFIG_PATH.parent / ".sgate"
+CLAUDE_HOME = Path(os.environ.get("CLAUDE_HOME", Path.home() / ".claude")).expanduser()
+CLAUDE_CODE_SETTINGS_PATH = Path(os.environ.get(
+    "CLAUDE_CODE_SETTINGS", CLAUDE_HOME / "settings.json"
+)).expanduser()
+CLAUDE_DESKTOP_CONFIG_PATH = Path(os.environ.get(
+    "CLAUDE_DESKTOP_CONFIG",
+    Path.home() / "Library" / "Application Support" / "Claude" / "claude_desktop_config.json",
+)).expanduser()
+CLAUDE_BACKUP_DIR = CLAUDE_HOME / "sgate-backups"
+CLAUDE_ORIGINAL_KEY_SLUG = "__sgate_claude_original__"
 # Keep the legacy service name so upgrades retain existing Keychain secrets.
 KEYCHAIN_PREFIX = "codex-channel"
 SCRIPT_PATH = Path(__file__).resolve()
@@ -47,6 +61,7 @@ CCSWITCH_DB = Path.home() / ".cc-switch" / "cc-switch.db"
 DEFAULT_MODEL = "gpt-5.6"
 DEFAULT_EFFORT = "high"
 EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
+CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh")
 _KEY_PUSHBACK: dict[int, list[bytes]] = {}
 
 # ---------------------------------------------------------------------------
@@ -880,6 +895,351 @@ def opencode_credentials_path(slug: str) -> Path:
     return OPENCODE_CREDENTIALS_DIR / f"{slug}-api-key"
 
 
+def claude_settings_read() -> dict[str, Any]:
+    if not CLAUDE_CODE_SETTINGS_PATH.exists():
+        return {}
+    try:
+        value = json.loads(CLAUDE_CODE_SETTINGS_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        die(f"无法读取 Claude Code 配置 {CLAUDE_CODE_SETTINGS_PATH}：{exc}")
+    if not isinstance(value, dict):
+        die(f"Claude Code 配置必须是 JSON 对象：{CLAUDE_CODE_SETTINGS_PATH}")
+    return value
+
+
+def claude_settings_backup(settings: dict[str, Any] | None = None) -> Path | None:
+    if not CLAUDE_CODE_SETTINGS_PATH.exists():
+        return None
+    CLAUDE_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    backup = CLAUDE_BACKUP_DIR / f"settings.json.sgate-{now_stamp()}.bak"
+    if settings is None:
+        shutil.copy2(CLAUDE_CODE_SETTINGS_PATH, backup)
+    else:
+        backup.write_text(json.dumps(settings, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.chmod(backup, 0o600)
+    return backup
+
+
+def claude_settings_write(settings: dict[str, Any]) -> None:
+    CLAUDE_CODE_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = CLAUDE_CODE_SETTINGS_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(settings, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, CLAUDE_CODE_SETTINGS_PATH)
+    os.chmod(CLAUDE_CODE_SETTINGS_PATH, 0o600)
+
+
+def claude_env(settings: dict[str, Any]) -> dict[str, str]:
+    value = settings.get("env", {})
+    return {str(k): str(v) for k, v in value.items()} if isinstance(value, dict) else {}
+
+
+def claude_model_families(model: str) -> dict[str, str]:
+    lower = model.casefold()
+    families: dict[str, str] = {}
+    if "fable" in lower:
+        families["fable"] = model
+    elif "opus" in lower:
+        families["opus"] = model
+    elif "sonnet" in lower:
+        families["sonnet"] = model
+    elif "haiku" in lower:
+        families["haiku"] = model
+    return families
+
+
+def _safe_claude_settings_snapshot(settings: dict[str, Any]) -> dict[str, Any]:
+    """Keep a restorable settings snapshot without copying API credentials."""
+    snapshot = json.loads(json.dumps(settings, ensure_ascii=False))
+    env = snapshot.get("env")
+    if isinstance(env, dict):
+        for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
+            env.pop(key, None)
+    return snapshot
+
+
+def _is_sgate_claude_helper(value: Any) -> bool:
+    return isinstance(value, str) and "claude-token" in value and SCRIPT_PATH.name in value
+
+
+def _is_sgate_channel_helper(value: Any) -> bool:
+    return _is_sgate_claude_helper(value) and CLAUDE_ORIGINAL_KEY_SLUG not in str(value)
+
+
+def claude_current_info() -> dict[str, Any]:
+    settings = claude_settings_read()
+    env = claude_env(settings)
+    model = str(settings.get("model") or env.get("ANTHROPIC_MODEL") or "default")
+    effort = str(settings.get("effortLevel") or env.get("CLAUDE_CODE_EFFORT_LEVEL") or "auto")
+    base_url = env.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
+    token_set = bool(env.get("ANTHROPIC_AUTH_TOKEN") or env.get("ANTHROPIC_API_KEY") or settings.get("apiKeyHelper"))
+    return {
+        "model": model,
+        "effort": effort,
+        "base_url": base_url,
+        "token_set": token_set,
+        "settings": settings,
+    }
+
+
+def claude_provider_models(channel: dict[str, Any]) -> list[str]:
+    selected = _normalized_values(_channel_value(channel, "claude", "selected_models"))
+    default = str(_channel_value(channel, "claude", "model") or channel.get("model") or DEFAULT_MODEL)
+    if default not in selected:
+        selected.insert(0, default)
+    return selected
+
+
+def select_claude_code_channel(
+    slug: str,
+    *,
+    model: str | None = None,
+    effort: str | None = None,
+    selected_models: list[str] | None = None,
+    selected_efforts: list[str] | None = None,
+) -> None:
+    data = load_channels()
+    channel = data.get("channels", {}).get(slug)
+    if not channel:
+        die(f"渠道不存在：{slug}。先执行 add。")
+    model = model or str(_channel_value(channel, "claude", "model") or channel.get("model") or "sonnet")
+    effort = effort or str(_channel_value(channel, "claude", "reasoning_effort") or "high")
+    if effort not in CLAUDE_EFFORTS:
+        die(f"Claude Code 思考强度必须是：{', '.join(CLAUDE_EFFORTS)}")
+    models = _normalized_values(selected_models) if selected_models is not None else claude_provider_models(channel)
+    if model not in models:
+        models.insert(0, model)
+    efforts = _normalized_values(selected_efforts, CLAUDE_EFFORTS) if selected_efforts is not None else _normalized_values(
+        _channel_value(channel, "claude", "selected_efforts"), CLAUDE_EFFORTS
+    )
+    if effort not in efforts:
+        efforts.append(effort)
+
+    settings = claude_settings_read()
+    env = claude_env(settings)
+    previous = claude_current_info()
+    safe_backup = _safe_claude_settings_snapshot(settings)
+    if not data.get("claude_fallback") and not _is_sgate_channel_helper(settings.get("apiKeyHelper")):
+        data["claude_fallback"] = {
+            "settings": _safe_claude_settings_snapshot(previous["settings"]),
+            "has_original_auth": bool(env.get("ANTHROPIC_AUTH_TOKEN") or env.get("ANTHROPIC_API_KEY")),
+            "saved_at": datetime.now(timezone.utc).isoformat(),
+        }
+        original_auth = env.get("ANTHROPIC_AUTH_TOKEN") or env.get("ANTHROPIC_API_KEY")
+        if original_auth:
+            keychain_set(CLAUDE_ORIGINAL_KEY_SLUG, original_auth)
+    for secret_key in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"):
+        env.pop(secret_key, None)
+    env.update({
+        "ANTHROPIC_BASE_URL": str(channel["base_url"]).rstrip("/"),
+        "ANTHROPIC_MODEL": model,
+        "CLAUDE_CODE_EFFORT_LEVEL": effort,
+    })
+    for family in ("FABLE", "OPUS", "SONNET", "HAIKU"):
+        env.pop(f"ANTHROPIC_DEFAULT_{family}_MODEL", None)
+    for family, family_model in claude_model_families(model).items():
+        env[f"ANTHROPIC_DEFAULT_{family.upper()}_MODEL"] = family_model
+    settings["env"] = env
+    settings["model"] = model
+    settings["effortLevel"] = effort
+    settings["apiKeyHelper"] = (
+        f"{shlex.quote(str(SCRIPT_PATH))} claude-token {shlex.quote(slug)}"
+    )
+    settings.setdefault("$schema", "https://json.schemastore.org/claude-code-settings.json")
+    backup = claude_settings_backup(safe_backup)
+    claude_settings_write(settings)
+    channel.update({
+        "claude_model": model,
+        "claude_reasoning_effort": effort,
+        "claude_selected_models": models,
+        "claude_selected_efforts": efforts,
+        "claude_enabled": True,
+        "claude_last_enabled_at": datetime.now(timezone.utc).isoformat(),
+    })
+    for item in data.get("channels", {}).values():
+        if item is not channel:
+            item["claude_enabled"] = False
+    data["claude_active"] = slug
+    save_channels(data)
+    print_heading("Claude Code 已启用", f"{channel.get('name', slug)} ({slug})")
+    print_field("Base URL", channel["base_url"])
+    print_field("默认模型", model, tone="accent")
+    print_field("思考强度", effort, tone="accent")
+    print_field("候选模型", f"{len(models)} 个")
+    print_field("候选强度", f"{len(efforts)} 个")
+    if backup:
+        print_note(f"已备份 Claude Code 配置：{backup}")
+    print_note("Claude Code 新会话会读取新配置；运行中的会话请重启。", kind="warn")
+
+
+def deactivate_claude_code_channel(slug: str | None = None, *, quiet: bool = False) -> None:
+    data = load_channels()
+    active = str(data.get("claude_active") or slug or "")
+    settings = claude_settings_read()
+    helper_managed = _is_sgate_channel_helper(settings.get("apiKeyHelper"))
+    if not active and not helper_managed:
+        if not quiet:
+            print_note("当前没有由 SGate 管理的 Claude Code 渠道。", kind="warn")
+        return
+    fallback = data.get("claude_fallback") if isinstance(data.get("claude_fallback"), dict) else {}
+    backup = claude_settings_backup(_safe_claude_settings_snapshot(settings))
+    restored = fallback.get("settings") if isinstance(fallback.get("settings"), dict) else None
+    if restored is not None:
+        settings = json.loads(json.dumps(restored, ensure_ascii=False))
+        env = claude_env(settings)
+        if fallback.get("has_original_auth"):
+            env.pop("ANTHROPIC_API_KEY", None)
+            env.pop("ANTHROPIC_AUTH_TOKEN", None)
+            settings["apiKeyHelper"] = f"{shlex.quote(str(SCRIPT_PATH))} claude-token {CLAUDE_ORIGINAL_KEY_SLUG}"
+        settings["env"] = env
+    else:
+        env = claude_env(settings)
+        for key in (
+            "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "CLAUDE_CODE_EFFORT_LEVEL",
+            "ANTHROPIC_DEFAULT_FABLE_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        ):
+            env.pop(key, None)
+        settings["env"] = env
+        if helper_managed:
+            settings.pop("apiKeyHelper", None)
+        settings.pop("model", None)
+        settings.pop("effortLevel", None)
+    claude_settings_write(settings)
+    channel = data.get("channels", {}).get(active)
+    if channel:
+        channel["claude_enabled"] = False
+        channel["claude_last_disabled_at"] = datetime.now(timezone.utc).isoformat()
+    data["claude_active"] = None
+    data.pop("claude_fallback", None)
+    save_channels(data)
+    if not quiet:
+        if backup:
+            print_note(f"已备份 Claude Code 配置：{backup}")
+        print_note("已停用 Claude Code 渠道并恢复停用前配置。", kind="ok")
+        print_note("新会话会读取恢复后的配置；运行中的会话请重启。", kind="warn")
+
+
+def configure_claude_code_channel() -> None:
+    slug = choose_channel("Claude Code：选择渠道", runtime="claude")
+    if not slug:
+        return
+    channel = load_channels()["channels"][slug]
+    models = _normalized_values(channel.get("models")) or claude_provider_models(channel)
+    model_pick = choose_models(
+        models,
+        defaults=claude_provider_models(channel),
+        default_value=_channel_value(channel, "claude", "model") or channel.get("model") or "sonnet",
+    )
+    if not model_pick:
+        return
+    selected_models, model = model_pick
+    effort_pick = terminal_multi(
+        "Claude Code：选择思考强度\n  Space 勾选候选；Enter 将光标项设为默认",
+        [(e, e + ("  · 当前默认" if e == _channel_value(channel, "claude", "reasoning_effort") else "")) for e in CLAUDE_EFFORTS],
+        defaults=_normalized_values(_channel_value(channel, "claude", "selected_efforts"), CLAUDE_EFFORTS) or list(CLAUDE_EFFORTS),
+        default_value=_channel_value(channel, "claude", "reasoning_effort") or "high",
+    )
+    if not effort_pick:
+        return
+    selected_efforts, effort = effort_pick
+    select_claude_code_channel(slug, model=model, effort=effort, selected_models=selected_models, selected_efforts=selected_efforts)
+
+
+def print_claude_code_status() -> None:
+    info = claude_current_info()
+    data = load_channels()
+    active = data.get("claude_active")
+    channel = data.get("channels", {}).get(active) if active else None
+    print_heading("Claude Code 当前配置")
+    print_field("配置文件", CLAUDE_CODE_SETTINGS_PATH)
+    print_field("当前渠道", f"{channel.get('name', active)} ({active})" if channel else "官方 Anthropic / 未登记", tone="ok" if channel else "warn")
+    print_field("Base URL", info["base_url"])
+    print_field("默认模型", info["model"], tone="accent")
+    print_field("思考强度", info["effort"], tone="accent")
+    print_field("认证状态", "已配置" if info["token_set"] else "未配置", tone="ok" if info["token_set"] else "warn")
+    print_note("Claude Code 支持 low / medium / high / xhigh；max 仅适用于单次会话。", kind="info")
+
+
+def claude_desktop_status() -> None:
+    print_heading("Claude Desktop 当前配置")
+    print_field("配置文件", CLAUDE_DESKTOP_CONFIG_PATH)
+    print_field("Code tab 配置", CLAUDE_CODE_SETTINGS_PATH)
+    print_field("应用", "已安装" if Path("/Applications/Claude.app").exists() else "未检测到", tone="ok" if Path("/Applications/Claude.app").exists() else "warn")
+    if not CLAUDE_DESKTOP_CONFIG_PATH.exists():
+        print_note("尚未找到 Claude Desktop 配置文件。", kind="warn")
+        return
+    try:
+        config = json.loads(CLAUDE_DESKTOP_CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        print_note(f"配置无法解析：{exc}", kind="err")
+        return
+    mcp = config.get("mcpServers", {}) if isinstance(config, dict) else {}
+    print_field("MCP 服务", f"{len(mcp)} 个")
+    print_note("Claude Desktop 原生不提供自定义 API Base URL、API Key 或模型 provider 配置。", kind="warn")
+    print_note("Desktop 的 Code tab 使用同一份 Claude Code settings.json，因此 SGate 的 Claude Code 渠道会同步影响 Code tab。", kind="ok")
+    print_note("Desktop Chat/Cowork 渠道仍由 Claude Desktop 自身的账户、连接器和扩展设置管理。")
+
+
+def select_claude_desktop_channel(slug: str, *, model: str | None = None, effort: str | None = None) -> None:
+    """Apply a Claude Code channel to Claude Desktop's Code tab."""
+    select_claude_code_channel(slug, model=model, effort=effort)
+    print_note("Claude Desktop 的 Code tab 使用同一份 Claude Code 配置，重启或新建 Code session 后生效。", kind="ok")
+
+
+def claude_desktop_interactive() -> None:
+    while True:
+        try:
+            info = claude_current_info()
+            choice = terminal_menu(
+                "Claude Desktop\n"
+                f"Code tab：{info['model']} · {info['effort']} · {info['base_url']}",
+                [
+                    ("use", "[Code tab] 选择渠道、模型和思考强度"),
+                    ("status", "[状态] 查看 Desktop 配置、MCP 和 Code tab 状态"),
+                    ("back", "[返回] 回到工具选择"),
+                ],
+                default="use",
+            )
+            if choice in (None, "back"):
+                return
+            if choice == "use":
+                configure_claude_code_channel()
+                print_note("上述选择会应用到 Claude Desktop 的 Code tab。", kind="ok")
+            elif choice == "status":
+                claude_desktop_status()
+            pause_after_action()
+        except (KeyboardInterrupt, EOFError):
+            print("\n已退出。")
+            return
+
+
+def claude_code_interactive() -> None:
+    while True:
+        try:
+            info = claude_current_info()
+            title = f"Claude Code 渠道切换器\n当前：{info['model']} · {info['effort']} · {info['base_url']}"
+            choice = terminal_menu(title, [
+                ("use", "[切换] 选择渠道、模型和思考强度"),
+                ("configure", "[配置] 重新选择当前渠道的模型和思考强度"),
+                ("disable", "[停用] 恢复 Claude Code 原有配置"),
+                ("status", "[状态] 查看 Claude Code 实际配置"),
+                ("back", "[返回] 回到工具选择"),
+            ], default="use")
+            if choice in (None, "back"):
+                return
+            if choice in ("use", "configure"):
+                configure_claude_code_channel()
+            elif choice == "disable":
+                deactivate_claude_code_channel()
+            elif choice == "status":
+                print_claude_code_status()
+            pause_after_action()
+        except (KeyboardInterrupt, EOFError):
+            print("\n已退出。")
+            return
+
+
 def opencode_write_runtime_key(slug: str) -> None:
     """Materialize the selected Keychain secret for OpenCode's file interpolation."""
     key = keychain_get(slug)
@@ -1355,14 +1715,19 @@ def engine_interactive() -> None:
                 "官方登录" if codex_info["provider_id"] == "openai" else codex_info["provider_id"],
             )
             oc_enabled = opencode_enabled_slugs()
+            claude_info = claude_current_info()
+            claude_name = data.get("claude_active") or "未启用"
             choice = terminal_menu(
                 "SGate 渠道切换器\n"
                 f"渠道 {total} 个　|　Codex：{codex_name} · {codex_info['model']}"
-                f"　|　OpenCode：{len(oc_enabled)} 个已启用",
+                f"　|　OpenCode：{len(oc_enabled)} 个已启用"
+                f"　|　Claude Code：{claude_name} · {claude_info['model']}",
                 [
                     ("channels", "[渠道管理] 新增、删除、总览和连接检查"),
                     ("codex", "[Codex] 选择渠道、模型、思考强度并启用"),
                     ("opencode", "[OpenCode] 多渠道启用、模型与思考强度"),
+                    ("claude-code", "[Claude Code] 渠道、模型与思考强度"),
+                    ("claude-desktop", "[Claude Desktop] 查看账户、MCP 与配置能力"),
                     ("exit", "[退出] 关闭菜单"),
                 ], default="codex")
             if choice in (None, "exit"):
@@ -1373,6 +1738,10 @@ def engine_interactive() -> None:
                 interactive()
             elif choice == "opencode":
                 opencode_interactive()
+            elif choice == "claude-code":
+                claude_code_interactive()
+            elif choice == "claude-desktop":
+                claude_desktop_interactive()
         except (KeyboardInterrupt, EOFError):
             print("\n已退出。")
             return
@@ -2063,6 +2432,7 @@ def choose_channel(title: str = "选择渠道", *, runtime: str = "codex") -> st
         return None
     codex_actual = current_config_info()["provider_id"] if runtime in ("codex", "all") else ""
     opencode_actual = current_opencode_info(strict=False)["provider_id"] if runtime in ("opencode", "all") else ""
+    claude_actual = load_channels().get("claude_active") if runtime in ("claude", "all") else None
     options = []
     for slug, channel in channels.items():
         active_labels = []
@@ -2070,8 +2440,11 @@ def choose_channel(title: str = "选择渠道", *, runtime: str = "codex") -> st
             active_labels.append("Codex")
         if runtime in ("opencode", "all") and opencode_provider_id(slug) == opencode_actual:
             active_labels.append("OpenCode")
+        if runtime in ("claude", "all") and slug == claude_actual:
+            active_labels.append("Claude Code")
         active = f"  [当前：{' / '.join(active_labels)}]" if active_labels else ""
-        options.append((slug, f"{channel.get('name', slug)} ({slug}) · {channel.get('model', '(未选)')}{active}"))
+        model = _channel_value(channel, runtime, "model") if runtime in ("opencode", "claude") else channel.get("model")
+        options.append((slug, f"{channel.get('name', slug)} ({slug}) · {model or '(未选)'}{active}"))
     return terminal_menu(title, options)
 
 
@@ -2183,6 +2556,7 @@ def list_channels() -> None:
     codex_actual = current_config_info()["provider_id"]
     opencode_info = current_opencode_info(strict=False)
     opencode_managed = set(opencode_info["managed_providers"])
+    claude_active = data.get("claude_active")
     print_heading("已保存的渠道", f"共 {len(channels)} 个")
     rows = []
     for slug, channel in channels.items():
@@ -2213,6 +2587,21 @@ def list_channels() -> None:
         ["名称", "slug", "Codex", "Codex 配置", "OpenCode", "OpenCode 配置", "模型"],
         rows,
     )
+    print()
+    claude_rows = []
+    for slug, channel in channels.items():
+        claude_model = _channel_value(channel, "claude", "model") or "(未选)"
+        claude_effort = _channel_value(channel, "claude", "reasoning_effort") or "high"
+        is_active = slug == claude_active
+        claude_rows.append([
+            channel.get("name", slug),
+            slug,
+            green(f"{ICON_ON} 当前") if is_active else dim(f"{ICON_OFF} 未用"),
+            f"{claude_model}/{claude_effort}",
+        ])
+    print_heading("Claude Code 渠道", f"当前：{claude_active or '未启用'}")
+    print_table(["名称", "slug", "状态", "模型/强度"], claude_rows)
+    print_note("Claude Desktop 不提供自定义 API provider；请通过 Desktop 账户、Code tab 和 MCP 设置管理。")
 
 
 def remove_channel(slug: str) -> None:
@@ -2236,6 +2625,9 @@ def remove_channel(slug: str) -> None:
             remove_opencode_provider(slug)
     elif opencode_current:
         print("警告：OpenCode 配置损坏，已跳过配置清理；请修复后手动删除该渠道的 OpenCode provider。")
+    if data.get("claude_active") == slug:
+        deactivate_claude_code_channel(slug, quiet=True)
+        data = load_channels()
     try:
         opencode_credentials_path(slug).unlink()
     except FileNotFoundError:
@@ -2474,7 +2866,7 @@ def interactive() -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="sgate",
-        description="切换 Codex 全局 API Key 渠道或官方登录渠道；API Key 存储在 macOS Keychain。",
+        description="切换 Codex、OpenCode、Claude Code 及 Claude Desktop Code tab 渠道；API Key 存储在 macOS Keychain。",
     )
     sub = parser.add_subparsers(dest="command")
 
@@ -2538,8 +2930,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_oc.add_argument("--reasoning", choices=EFFORTS)
     p_oc.add_argument("--default", dest="default_slug", help="sync 时指定默认渠道")
 
+    p_cc = sub.add_parser("claude-code", help="切换 Claude Code 渠道、模型和思考强度")
+    p_cc.add_argument("action", nargs="?", choices=("use", "configure", "disable", "status"), default=None)
+    p_cc.add_argument("slug", nargs="?")
+    p_cc.add_argument("--model")
+    p_cc.add_argument("--effort", choices=CLAUDE_EFFORTS)
+
+    p_cd = sub.add_parser("claude-desktop", help="切换 Claude Desktop Code tab 渠道或查看 MCP 状态")
+    p_cd.add_argument("action", nargs="?", choices=("use", "disable", "status"), default=None)
+    p_cd.add_argument("slug", nargs="?")
+    p_cd.add_argument("--model")
+    p_cd.add_argument("--effort", choices=CLAUDE_EFFORTS)
+
     p_token = sub.add_parser("token", help=argparse.SUPPRESS)
     p_token.add_argument("slug")
+
+    p_claude_token = sub.add_parser("claude-token", help=argparse.SUPPRESS)
+    p_claude_token.add_argument("slug")
     return parser
 
 
@@ -2603,8 +3010,34 @@ def main() -> None:
             configure_opencode_channel()
         else:
             opencode_interactive()
+    elif args.command == "claude-code":
+        if args.action == "status":
+            print_claude_code_status()
+        elif args.action == "use":
+            if not args.slug:
+                die("Claude Code use 需要渠道 slug")
+            select_claude_code_channel(args.slug, model=args.model, effort=args.effort)
+        elif args.action == "configure":
+            configure_claude_code_channel()
+        elif args.action == "disable":
+            deactivate_claude_code_channel(args.slug)
+        else:
+            claude_code_interactive()
+    elif args.command == "claude-desktop":
+        if args.action == "use":
+            if not args.slug:
+                die("Claude Desktop use 需要渠道 slug")
+            select_claude_desktop_channel(args.slug, model=args.model, effort=args.effort)
+        elif args.action == "disable":
+            deactivate_claude_code_channel(args.slug)
+        elif args.action == "status":
+            claude_desktop_status()
+        else:
+            claude_desktop_interactive()
     elif args.command == "token":
         token_command(args.slug)
+    elif args.command == "claude-token":
+        sys.stdout.write(keychain_get(args.slug) + "\n")
 
 
 if __name__ == "__main__":
