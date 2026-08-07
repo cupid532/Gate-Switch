@@ -23,6 +23,16 @@ source ~/.zshrc
 sgate
 ```
 
+如果 GitHub 仓库已经更新但本机菜单仍是旧版，请重新安装到实际的 PATH 入口：
+
+```sh
+install -m 700 sgate.py "$HOME/.local/bin/sgate"
+rehash 2>/dev/null || true
+sgate --help
+```
+
+确认帮助中出现 `claude-code` 和 `claude-desktop` 后，再运行 `sgate`。
+
 ## 主要功能
 
 - API Key 只写入 macOS Keychain，不写入 `config.toml` 或命令行参数。
