@@ -36,7 +36,9 @@ sgate
 - 每次修改前自动备份 Codex 配置。
 - 启动后可先选择 `Codex` 或 `OpenCode`，两套配置互不覆盖。
 - 交互菜单将“渠道管理”和“工具配置”分开：新增、删除、总览、连接检查在外层完成；进入 Codex/OpenCode 后再选择模型和推理强度。
+- OpenCode 支持多渠道同时启用：所有勾选渠道都会写入 `provider`，其中一个作为默认，可在 OpenCode 内用 `/models` 直接切换。
 - OpenCode 使用合法的 `provider`、`model` 和 `agent.build.variant` 配置，保留 `minimal`、`low`、`medium`、`high`、`xhigh` 思考强度。
+- 状态、总览、连接检查均为带颜色的分栏表格输出；管道输出、`NO_COLOR` 或非 TTY 环境自动降级为纯文本。
 - OpenCode API Key 仍以 macOS Keychain 为密钥源；运行 OpenCode 时写入每渠道独立、权限为 `0600` 的临时引用文件，并通过 `{file:...}` 引用，不写入 `opencode.json`。
 
 ## 交互按键
@@ -66,10 +68,19 @@ sgate channels
 # 直接打开 OpenCode 菜单
 sgate opencode
 
-# 直接切换 OpenCode 渠道和思考强度
+# 切换 OpenCode 默认渠道和思考强度
 sgate opencode use fusiongate --model gpt-5.6-sol --reasoning xhigh
 
-# 查看 OpenCode 当前实际配置
+# 追加启用一个渠道，但不改变当前默认渠道
+sgate opencode add congee
+
+# 一次性指定全部启用渠道，并选定默认渠道
+sgate opencode sync fusiongate congee --default fusiongate
+
+# 从 OpenCode 配置移除某个渠道
+sgate opencode disable congee
+
+# 查看 OpenCode 当前实际配置（含多渠道列表）
 sgate opencode status
 
 # 查看实际配置和已保存渠道

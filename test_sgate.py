@@ -61,7 +61,15 @@ class SGateTests(unittest.TestCase):
                     "model": "model-1",
                     "reasoning_effort": "high",
                     "models": ["model-1", "model-2", "gpt-image-2"],
-                }
+                },
+                "second": {
+                    "slug": "second",
+                    "name": "Second",
+                    "base_url": "https://second.example/v1",
+                    "model": "s-model-1",
+                    "reasoning_effort": "low",
+                    "models": ["s-model-1", "s-model-2"],
+                },
             },
         })
 
@@ -209,6 +217,83 @@ class SGateTests(unittest.TestCase):
         sgate.OPENCODE_CONFIG_PATH.write_text("not-json", encoding="utf-8")
         with patch.object(sgate, "terminal_menu", return_value=None):
             self.assertIsNone(sgate.choose_channel("Codex", runtime="codex"))
+
+    def test_opencode_keeps_multiple_providers_enabled(self) -> None:
+        sgate.select_opencode_channel("test", model="model-2", effort="high")
+        sgate.select_opencode_channel("second", model="s-model-2", effort="low")
+        config = json.loads(sgate.OPENCODE_CONFIG_PATH.read_text(encoding="utf-8"))
+
+        # Both providers must coexist; enabling one must not drop the other.
+        self.assertIn("sgate_test", config["provider"])
+        self.assertIn("sgate_second", config["provider"])
+        # The most recent selection becomes the default model.
+        self.assertEqual(config["model"], "sgate_second/s-model-2")
+        self.assertEqual(config["agent"]["build"]["variant"], "low")
+        self.assertEqual(
+            sorted(sgate.opencode_enabled_slugs()), ["second", "test"]
+        )
+        # Each provider keeps its own credential file.
+        self.assertTrue(sgate.opencode_credentials_path("test").exists())
+        self.assertTrue(sgate.opencode_credentials_path("second").exists())
+
+    def test_opencode_add_without_default_preserves_current_default(self) -> None:
+        sgate.select_opencode_channel("test", model="model-2", effort="high")
+        sgate.select_opencode_channel(
+            "second", model="s-model-2", effort="low", make_default=False
+        )
+        config = json.loads(sgate.OPENCODE_CONFIG_PATH.read_text(encoding="utf-8"))
+        self.assertIn("sgate_second", config["provider"])
+        self.assertEqual(config["model"], "sgate_test/model-2")
+        data = json.loads(sgate.CHANNELS_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(data["opencode_active"], "test")
+
+    def test_opencode_sync_replaces_enabled_set(self) -> None:
+        sgate.select_opencode_channel("test", model="model-2", effort="high")
+        sgate.sync_opencode_channels(["second"], "second")
+        config = json.loads(sgate.OPENCODE_CONFIG_PATH.read_text(encoding="utf-8"))
+        self.assertNotIn("sgate_test", config.get("provider", {}))
+        self.assertIn("sgate_second", config["provider"])
+        self.assertEqual(config["model"], "sgate_second/s-model-2")
+        self.assertEqual(sgate.opencode_enabled_slugs(), ["second"])
+
+    def test_disabling_default_promotes_remaining_channel(self) -> None:
+        sgate.select_opencode_channel("test", model="model-2", effort="high")
+        sgate.select_opencode_channel(
+            "second", model="s-model-2", effort="low", make_default=False
+        )
+        sgate.deactivate_opencode_channel("test")
+        config = json.loads(sgate.OPENCODE_CONFIG_PATH.read_text(encoding="utf-8"))
+        self.assertNotIn("sgate_test", config.get("provider", {}))
+        self.assertEqual(config["model"], "sgate_second/s-model-2")
+        data = json.loads(sgate.CHANNELS_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(data["opencode_active"], "second")
+
+    def test_disabling_last_channel_restores_original_config(self) -> None:
+        sgate.OPENCODE_CONFIG_PATH.write_text(
+            json.dumps({"model": "other/original", "agent": {"build": {"variant": "medium"}}}),
+            encoding="utf-8",
+        )
+        sgate.select_opencode_channel("test", model="model-2", effort="high")
+        sgate.deactivate_opencode_channel("test")
+        config = json.loads(sgate.OPENCODE_CONFIG_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(config["model"], "other/original")
+        self.assertNotIn("sgate_test", config.get("provider", {}))
+
+    def test_styling_is_plain_without_color_support(self) -> None:
+        with patch.dict(os.environ, {"NO_COLOR": "1"}, clear=False):
+            self.assertFalse(sgate.color_enabled())
+            self.assertEqual(sgate.bold("x"), "x")
+            self.assertEqual(sgate.green("ok"), "ok")
+
+    def test_display_width_handles_cjk_and_ansi(self) -> None:
+        with patch.dict(os.environ, {"SGATE_FORCE_COLOR": "1"}, clear=False):
+            colored = sgate.green("ok")
+            self.assertNotEqual(colored, "ok")
+            # ANSI escapes must not count toward visible width.
+            self.assertEqual(sgate.display_width(colored), 2)
+        self.assertEqual(sgate.display_width("渠道"), 4)
+        self.assertEqual(sgate.display_width("ab"), 2)
+        self.assertEqual(sgate.display_width(sgate.pad("渠道", 6)), 6)
 
     def test_opencode_refresh_keeps_codex_selection_separate(self) -> None:
         data = json.loads(sgate.CHANNELS_PATH.read_text(encoding="utf-8"))

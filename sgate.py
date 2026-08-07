@@ -21,6 +21,7 @@ import termios
 import textwrap
 import time
 import tty
+import unicodedata
 try:
     import tomllib  # Python 3.11+
 except ModuleNotFoundError:  # macOS systems that still ship Python 3.8/3.9
@@ -48,9 +49,130 @@ DEFAULT_EFFORT = "high"
 EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
 _KEY_PUSHBACK: dict[int, list[bytes]] = {}
 
+# ---------------------------------------------------------------------------
+# Terminal styling
+#
+# Colors are disabled automatically when stdout is not a TTY, when TERM=dumb,
+# or when NO_COLOR is set, so piped output and logs stay plain text.
+# ---------------------------------------------------------------------------
+
+ICON_ON = "●"
+ICON_OFF = "○"
+ICON_OK = "✓"
+ICON_WARN = "!"
+ICON_ERR = "✗"
+ICON_ARROW = "→"
+
+
+def color_enabled() -> bool:
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("SGATE_FORCE_COLOR"):
+        return True
+    return bool(sys.stdout.isatty()) and os.environ.get("TERM", "") != "dumb"
+
+
+def paint(text: str, *codes: str) -> str:
+    if not codes or not color_enabled():
+        return text
+    return f"\033[{';'.join(codes)}m{text}\033[0m"
+
+
+def bold(text: str) -> str:
+    return paint(text, "1")
+
+
+def dim(text: str) -> str:
+    return paint(text, "2")
+
+
+def cyan(text: str) -> str:
+    return paint(text, "36")
+
+
+def green(text: str) -> str:
+    return paint(text, "32")
+
+
+def yellow(text: str) -> str:
+    return paint(text, "33")
+
+
+def red(text: str) -> str:
+    return paint(text, "31")
+
+
+def magenta(text: str) -> str:
+    return paint(text, "35")
+
+
+def display_width(text: str) -> int:
+    """Visible width, ignoring ANSI codes and counting CJK glyphs as two cells."""
+    plain = re.sub(r"\033\[[0-9;]*m", "", text)
+    width = 0
+    for char in plain:
+        width += 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+    return width
+
+
+def pad(text: str, width: int) -> str:
+    return text + " " * max(0, width - display_width(text))
+
+
+def rule(width: int = 0) -> str:
+    if not width:
+        width = min(shutil.get_terminal_size((88, 24)).columns, 88)
+    return dim("─" * width)
+
+
+def print_heading(title: str, subtitle: str = "") -> None:
+    print()
+    print(bold(cyan(title)))
+    if subtitle:
+        print(dim(f"  {subtitle}"))
+    print(rule())
+
+
+def print_field(label: str, value: Any, *, indent: int = 2, label_width: int = 16,
+                tone: str = "") -> None:
+    text = str(value)
+    if tone == "ok":
+        text = green(text)
+    elif tone == "warn":
+        text = yellow(text)
+    elif tone == "err":
+        text = red(text)
+    elif tone == "accent":
+        text = cyan(text)
+    print(f"{' ' * indent}{dim(pad(label, label_width))}{text}")
+
+
+def print_note(message: str, *, kind: str = "info", indent: int = 2) -> None:
+    icons = {
+        "info": dim(ICON_ARROW),
+        "ok": green(ICON_OK),
+        "warn": yellow(ICON_WARN),
+        "err": red(ICON_ERR),
+    }
+    print(f"{' ' * indent}{icons.get(kind, icons['info'])} {message}")
+
+
+def print_table(headers: list[str], rows: list[list[str]], *, indent: int = 2) -> None:
+    if not rows:
+        return
+    widths = [display_width(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], display_width(cell))
+    prefix = " " * indent
+    print(prefix + "  ".join(dim(bold(pad(h, widths[i]))) for i, h in enumerate(headers)))
+    print(prefix + dim("  ".join("─" * widths[i] for i in range(len(headers)))))
+    for row in rows:
+        print(prefix + "  ".join(pad(cell, widths[i]) for i, cell in enumerate(row)))
+
 
 def die(message: str, code: int = 1) -> None:
-    print(f"错误：{message}", file=sys.stderr)
+    print(f"{red(ICON_ERR)} 错误：{message}", file=sys.stderr)
     raise SystemExit(code)
 
 
@@ -234,29 +356,32 @@ def _paint_picker(title: str, options: list[tuple[str, str]], cursor: int, selec
     start = max(0, min(cursor - page_size // 2, max(0, len(options) - page_size)))
     end = min(len(options), start + page_size)
     out = ["\033[2J\033[H"]
-    out.extend(f"  {line}" for line in title_lines)
-    out.append("")
+    for i, line in enumerate(title_lines):
+        out.append(f"  {bold(cyan(line))}" if i == 0 else f"  {dim(line)}")
+    out.append(f"  {rule()}")
     if query:
-        out.extend((f"  搜索：{query}", ""))
+        out.extend((f"  {dim('搜索：')}{yellow(query)}", ""))
     if start > 0:
-        out.append("  ↑ 还有更多")
+        out.append(dim("  ↑ 还有更多"))
     if not options:
-        out.append("    没有匹配项，请继续输入或按 Esc 清空搜索")
+        out.append(dim("    没有匹配项，请继续输入或按 Esc 清空搜索"))
     for index in range(start, end):
         _, label = options[index]
+        is_cursor = index == cursor
         if radio:
-            pointer = "❯" if index == cursor else " "
             is_selected = index in selected if isinstance(selected, set) else index == selected
-            marker = "[x]" if is_selected else "[ ]"
-            line = f"  {pointer} {marker} {label}"
+            pointer = cyan("❯") if is_cursor else " "
+            marker = green(f"[{ICON_OK}]") if is_selected else dim("[ ]")
+            text = bold(label) if is_cursor else label
+            line = f"  {pointer} {marker} {text}"
         else:
             line = f"    {label}"
-            if index == cursor:
-                line = f"\033[7m  ❯ {label}  \033[0m"
+            if is_cursor:
+                line = f"  {cyan('❯')} {bold(label)}"
         out.append(line)
     if end < len(options):
-        out.append("  ↓ 还有更多")
-    out.extend(("", f"  {help_text}"))
+        out.append(dim("  ↓ 还有更多"))
+    out.extend(("", f"  {dim(help_text)}"))
     # setraw() disables terminal newline translation on several terminal apps.
     # Always emit CRLF explicitly so every menu row starts in column zero.
     sys.stdout.write("\r\n".join(out))
@@ -798,7 +923,8 @@ def current_opencode_info(*, strict: bool = True) -> dict[str, Any]:
     config = opencode_read_config(strict=strict)
     model_ref = str(config.get("model", ""))
     provider_id_value, _, model = model_ref.partition("/")
-    provider = config.get("provider", {}).get(provider_id_value, {}) if isinstance(config.get("provider"), dict) else {}
+    providers = config.get("provider") if isinstance(config.get("provider"), dict) else {}
+    provider = providers.get(provider_id_value, {}) if isinstance(providers, dict) else {}
     variants = {}
     if isinstance(provider, dict) and isinstance(provider.get("models"), dict) and model in provider["models"]:
         variants = provider["models"][model].get("variants", {}) or {}
@@ -806,12 +932,69 @@ def current_opencode_info(*, strict: bool = True) -> dict[str, Any]:
     effort = str(build_agent.get("variant", "")) if isinstance(build_agent, dict) else ""
     if effort not in EFFORTS and isinstance(variants, dict) and variants:
         effort = next(iter(variants), "")
+    managed = sorted(
+        pid for pid in (providers or {})
+        if isinstance(pid, str) and pid.startswith("sgate_")
+    )
     return {
         "provider_id": provider_id_value,
         "provider": provider if isinstance(provider, dict) else {},
         "model": model or "(未设置)",
         "reasoning_effort": effort or "(未设置)",
+        "managed_providers": managed,
     }
+
+
+def opencode_enabled_slugs(*, strict: bool = False) -> list[str]:
+    """Slugs whose provider block is currently present in opencode.json."""
+    managed = set(current_opencode_info(strict=strict)["managed_providers"])
+    return [
+        slug for slug in load_channels().get("channels", {})
+        if opencode_provider_id(slug) in managed
+    ]
+
+
+def _remember_opencode_fallback(data: dict[str, Any], config: dict[str, Any]) -> None:
+    """Snapshot the pre-SGate OpenCode defaults so they can be restored later."""
+    current_provider = str(config.get("model", "")).partition("/")[0]
+    if not current_provider or current_provider.startswith("sgate_"):
+        return
+    build = config.get("agent", {}).get("build", {}) if isinstance(config.get("agent"), dict) else {}
+    data["opencode_fallback"] = {
+        "model": config.get("model"),
+        "small_model": config.get("small_model"),
+        "build_model": build.get("model") if isinstance(build, dict) else None,
+        "build_variant": build.get("variant") if isinstance(build, dict) else None,
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _resolve_opencode_selection(
+    channel: dict[str, Any],
+    model: str | None,
+    effort: str | None,
+    selected_models: list[str] | None,
+    selected_efforts: list[str] | None,
+) -> tuple[str, str, list[str], list[str]]:
+    model = model or str(_channel_value(channel, "opencode", "model") or DEFAULT_MODEL)
+    effort = effort or str(_channel_value(channel, "opencode", "reasoning_effort") or DEFAULT_EFFORT)
+    if effort not in EFFORTS:
+        die(f"推理强度必须是：{', '.join(EFFORTS)}")
+    models = (
+        _normalized_values(selected_models)
+        if selected_models is not None
+        else _normalized_values(_channel_value(channel, "opencode", "selected_models"))
+    ) or [model]
+    if model not in models:
+        models.append(model)
+    efforts = (
+        _normalized_values(selected_efforts, EFFORTS)
+        if selected_efforts is not None
+        else _normalized_values(_channel_value(channel, "opencode", "selected_efforts"), EFFORTS)
+    ) or list(EFFORTS)
+    if effort not in efforts:
+        efforts.append(effort)
+    return model, effort, models, efforts
 
 
 def select_opencode_channel(
@@ -821,68 +1004,103 @@ def select_opencode_channel(
     effort: str | None = None,
     selected_models: list[str] | None = None,
     selected_efforts: list[str] | None = None,
+    make_default: bool = True,
+    quiet: bool = False,
 ) -> None:
+    """Add or update one OpenCode provider.
+
+    OpenCode keeps every provider in `provider`, so enabling a channel never
+    removes the others. `make_default` decides whether this channel also becomes
+    the top-level `model` used by new sessions.
+    """
     data = load_channels()
     channel = data.get("channels", {}).get(slug)
     if not channel:
         die(f"渠道不存在：{slug}。先执行 add。")
     config = opencode_read_config()
-    model = model or str(_channel_value(channel, "opencode", "model") or DEFAULT_MODEL)
-    effort = effort or str(_channel_value(channel, "opencode", "reasoning_effort") or DEFAULT_EFFORT)
-    if effort not in EFFORTS:
-        die(f"推理强度必须是：{', '.join(EFFORTS)}")
-    selected_models = (
-        _normalized_values(selected_models)
-        if selected_models is not None
-        else _normalized_values(_channel_value(channel, "opencode", "selected_models"))
-    ) or [model]
-    if model not in selected_models:
-        selected_models.append(model)
-    selected_efforts = (
-        _normalized_values(selected_efforts, EFFORTS)
-        if selected_efforts is not None
-        else _normalized_values(_channel_value(channel, "opencode", "selected_efforts"), EFFORTS)
-    ) or list(EFFORTS)
-    if effort not in selected_efforts:
-        selected_efforts.append(effort)
-    channel.update({"opencode_model": model, "opencode_reasoning_effort": effort,
-                    "opencode_selected_models": selected_models,
-                    "opencode_selected_efforts": selected_efforts, "opencode_enabled": True,
-                    "opencode_last_enabled_at": datetime.now(timezone.utc).isoformat()})
-    for item in data.get("channels", {}).values():
-        if item is not channel:
-            item["opencode_enabled"] = False
-    data["opencode_active"] = slug
+    model, effort, chosen_models, chosen_efforts = _resolve_opencode_selection(
+        channel, model, effort, selected_models, selected_efforts
+    )
+    channel.update({
+        "opencode_model": model,
+        "opencode_reasoning_effort": effort,
+        "opencode_selected_models": chosen_models,
+        "opencode_selected_efforts": chosen_efforts,
+        "opencode_enabled": True,
+        "opencode_last_enabled_at": datetime.now(timezone.utc).isoformat(),
+    })
+    if make_default:
+        data["opencode_active"] = slug
     data["active"] = data.get("codex_active", data.get("active"))
+    _remember_opencode_fallback(data, config)
     save_channels(data)
     opencode_write_runtime_key(slug)
-    current_provider = str(config.get("model", "")).partition("/")[0]
-    if current_provider and not current_provider.startswith("sgate_"):
-        current_build = config.get("agent", {}).get("build", {}) if isinstance(config.get("agent"), dict) else {}
-        data["opencode_fallback"] = {
-            "model": config.get("model"),
-            "small_model": config.get("small_model"),
-            "build_model": current_build.get("model") if isinstance(current_build, dict) else None,
-            "build_variant": current_build.get("variant") if isinstance(current_build, dict) else None,
-            "saved_at": datetime.now(timezone.utc).isoformat(),
-        }
-        save_channels(data)
+
     config["$schema"] = "https://opencode.ai/config.json"
     provider_id_value = opencode_provider_id(slug)
     config.setdefault("provider", {})[provider_id_value] = opencode_provider_block(channel)
     model_ref = f"{provider_id_value}/{model}"
-    config["model"] = model_ref
-    build_agent = config.setdefault("agent", {}).setdefault("build", {})
-    if isinstance(build_agent, dict):
-        build_agent["model"] = model_ref
-        build_agent["variant"] = effort
+    if make_default:
+        config["model"] = model_ref
+        build_agent = config.setdefault("agent", {}).setdefault("build", {})
+        if isinstance(build_agent, dict):
+            build_agent["model"] = model_ref
+            build_agent["variant"] = effort
     backup = opencode_backup_config()
     opencode_write_config(config)
+    if quiet:
+        return
     if backup:
-        print(f"已备份 OpenCode 配置：{backup}")
-    print(f"已启用 OpenCode：{channel.get('name', slug)} ({slug})")
-    print(f"  Model：{model}\n  Reasoning：{effort}\n  配置：{OPENCODE_CONFIG_PATH}")
-    print("  OpenCode 需要重启后读取新配置。")
+        print_note(f"已备份 OpenCode 配置：{dim(str(backup))}")
+    label = "已启用并设为默认" if make_default else "已启用"
+    print_heading(f"OpenCode {label}", f"{channel.get('name', slug)} ({slug})")
+    print_field("Model", model, tone="accent")
+    print_field("Reasoning", effort, tone="accent")
+    print_field("可用模型", f"{len(chosen_models)} 个")
+    print_field("可用强度", f"{len(chosen_efforts)} 个")
+    print_field("配置", OPENCODE_CONFIG_PATH)
+    enabled = opencode_enabled_slugs()
+    if len(enabled) > 1:
+        print_field("同时启用", f"{len(enabled)} 个渠道：{', '.join(enabled)}")
+    print_note("OpenCode 需要重启后读取新配置。", kind="warn")
+
+
+def sync_opencode_channels(slugs: list[str], default_slug: str | None = None) -> None:
+    """Make opencode.json contain exactly these managed channels."""
+    data = load_channels()
+    known = data.get("channels", {})
+    wanted = [slug for slug in slugs if slug in known]
+    if not wanted:
+        for slug in opencode_enabled_slugs():
+            deactivate_opencode_channel(slug, quiet=True)
+        print_note("已停用所有 OpenCode 渠道。", kind="ok")
+        return
+    if default_slug not in wanted:
+        default_slug = wanted[0]
+
+    for slug in opencode_enabled_slugs():
+        if slug not in wanted:
+            deactivate_opencode_channel(slug, quiet=True)
+    for slug in wanted:
+        select_opencode_channel(slug, make_default=(slug == default_slug), quiet=True)
+
+    print_heading("OpenCode 渠道已同步", f"共 {len(wanted)} 个渠道")
+    rows = []
+    for slug in wanted:
+        channel = known[slug]
+        is_default = slug == default_slug
+        rows.append([
+            green(ICON_ON) if is_default else dim(ICON_ON),
+            channel.get("name", slug),
+            slug,
+            str(_channel_value(channel, "opencode", "model") or "(未选)"),
+            str(_channel_value(channel, "opencode", "reasoning_effort") or DEFAULT_EFFORT),
+            green("默认") if is_default else dim("可切换"),
+        ])
+    print_table(["", "名称", "slug", "模型", "强度", "状态"], rows)
+    print_note(f"配置：{OPENCODE_CONFIG_PATH}")
+    print_note("在 OpenCode 中可用 /models 在这些渠道之间直接切换。", kind="ok")
+    print_note("OpenCode 需要重启后读取新配置。", kind="warn")
 
 
 def remove_opencode_provider(slug: str, *, restore: bool = False) -> None:
@@ -930,18 +1148,32 @@ def remove_opencode_provider(slug: str, *, restore: bool = False) -> None:
             print(f"已备份 OpenCode 配置：{backup}")
 
 
-def deactivate_opencode_channel(slug: str) -> None:
-    remove_opencode_provider(slug, restore=True)
+def deactivate_opencode_channel(slug: str, *, quiet: bool = False) -> None:
+    """Remove one provider, promoting another managed channel if it was default."""
+    remaining = [s for s in opencode_enabled_slugs() if s != slug]
+    remove_opencode_provider(slug, restore=not remaining)
     data = load_channels()
     channel = data.get("channels", {}).get(slug)
     if channel:
         channel["opencode_enabled"] = False
         channel["opencode_last_disabled_at"] = datetime.now(timezone.utc).isoformat()
+    promoted: str | None = None
     if data.get("opencode_active") == slug:
-        data["opencode_active"] = None
-    data.pop("opencode_fallback", None)
+        data["opencode_active"] = remaining[0] if remaining else None
+        promoted = remaining[0] if remaining else None
+    if not remaining:
+        data.pop("opencode_fallback", None)
     save_channels(data)
-    print("已从 OpenCode 配置移除该渠道；重启 OpenCode 后生效。")
+    if promoted:
+        select_opencode_channel(promoted, make_default=True, quiet=True)
+    if quiet:
+        return
+    print_note(f"已从 OpenCode 配置移除渠道 {slug}。", kind="ok")
+    if promoted:
+        print_note(f"默认渠道已改为 {promoted}。")
+    elif not remaining:
+        print_note("已恢复 OpenCode 原有默认配置。")
+    print_note("重启 OpenCode 后生效。", kind="warn")
 
 
 def configure_opencode_channel() -> None:
@@ -976,27 +1208,109 @@ def configure_opencode_channel() -> None:
     select_opencode_channel(slug, model=model, effort=effort)
 
 
+def choose_opencode_channels() -> None:
+    """Enable several OpenCode channels at once and pick the default."""
+    data = load_channels()
+    channels = data.get("channels", {})
+    if not channels:
+        print_note("还没有渠道，请先在渠道管理中新增。", kind="warn")
+        return
+    enabled = opencode_enabled_slugs()
+    active = data.get("opencode_active")
+    options = []
+    for slug, channel in channels.items():
+        model = _channel_value(channel, "opencode", "model") or "(未选模型)"
+        effort = _channel_value(channel, "opencode", "reasoning_effort") or DEFAULT_EFFORT
+        tag = green("  [默认]") if slug == active else ("  [已启用]" if slug in enabled else "")
+        options.append((slug, f"{channel.get('name', slug)} ({slug}) · {model} · {effort}{tag}"))
+    picked = terminal_multi(
+        "OpenCode 多渠道\n  Space 勾选要同时启用的渠道；Enter 将光标项设为默认",
+        options,
+        defaults=enabled,
+        default_value=active if active in channels else (enabled[0] if enabled else None),
+        searchable=True,
+    )
+    if picked is None:
+        print_note("已取消，OpenCode 配置未改动。")
+        return
+    slugs, default_slug = picked
+    sync_opencode_channels(slugs, default_slug)
+
+
 def print_opencode_status(*, strict: bool = True) -> None:
     info = current_opencode_info(strict=strict)
-    print("\n当前 OpenCode 配置")
-    print(f"  配置：{OPENCODE_CONFIG_PATH}")
-    print(f"  provider：{info['provider_id'] or '(未设置)'}")
-    print(f"  Model：{info['model']}")
-    print(f"  Reasoning：{info['reasoning_effort']}")
+    data = load_channels()
+    channels = data.get("channels", {})
+    enabled = [
+        slug for slug in channels
+        if opencode_provider_id(slug) in set(info["managed_providers"])
+    ]
+    print_heading("OpenCode 当前配置")
+    print_field("配置文件", OPENCODE_CONFIG_PATH)
+    if not opencode_config_is_valid():
+        print_note("配置文件无法解析，以下信息可能不完整。", kind="err")
+    matched = next(
+        (c for s, c in channels.items() if opencode_provider_id(s) == info["provider_id"]),
+        None,
+    )
+    print_field("默认渠道", matched.get("name", matched.get("slug")) if matched else
+                (info["provider_id"] or "(未设置)"),
+                tone="ok" if matched else "warn")
+    print_field("默认模型", info["model"], tone="accent")
+    print_field("思考强度", info["reasoning_effort"], tone="accent")
+    print_field("启用渠道数", len(enabled) if enabled else "0")
+    if enabled:
+        rows = []
+        for slug in enabled:
+            channel = channels[slug]
+            is_default = opencode_provider_id(slug) == info["provider_id"]
+            models = _normalized_values(_channel_value(channel, "opencode", "selected_models"))
+            efforts = _normalized_values(_channel_value(channel, "opencode", "selected_efforts"), EFFORTS)
+            rows.append([
+                green(ICON_ON) if is_default else dim(ICON_ON),
+                channel.get("name", slug),
+                slug,
+                str(_channel_value(channel, "opencode", "model") or "(未选)"),
+                f"{len(models) or 1} 个",
+                f"{len(efforts) or len(EFFORTS)} 个",
+                green("默认") if is_default else dim("可切换"),
+            ])
+        print()
+        print_table(["", "名称", "slug", "默认模型", "模型", "强度", "状态"], rows)
+    unmanaged = [
+        pid for pid in info["managed_providers"]
+        if not any(opencode_provider_id(s) == pid for s in channels)
+    ]
+    if unmanaged:
+        print()
+        print_note(f"配置中存在已删除渠道的残留 provider：{', '.join(unmanaged)}", kind="warn")
 
 
 def opencode_interactive() -> None:
     while True:
         try:
-            info = current_opencode_info()
+            info = current_opencode_info(strict=False)
+            enabled = opencode_enabled_slugs()
+            data = load_channels()
+            matched = next(
+                (c for s, c in data.get("channels", {}).items()
+                 if opencode_provider_id(s) == info["provider_id"]),
+                None,
+            )
+            name = matched.get("name", matched.get("slug")) if matched else (
+                info["provider_id"] or "未设置"
+            )
             title = (
                 "OpenCode 渠道切换器\n"
-                f"  当前：{info['provider_id'] or '(未设置)'} · {info['model']} · reasoning={info['reasoning_effort']}"
+                f"默认：{name} · {info['model']} · {info['reasoning_effort']}"
+                f"　|　已启用 {len(enabled)} 个渠道"
             )
             choice = terminal_menu(title, [
-                ("use", "[切换] 启用渠道，并选择模型 / 推理强度"),
-                ("configure", "[配置] 重新选择模型 / 推理强度"),
-                ("refresh", "[模型] 拉取最新列表，用 Space 选择 / 取消"),
+                ("use", "[切换] 选择渠道并设为默认，同时配置模型 / 思考强度"),
+                ("multi", "[多渠道] 同时启用多个渠道，并指定默认渠道"),
+                ("configure", "[配置] 重新选择默认渠道的模型 / 思考强度"),
+                ("refresh", "[模型] 拉取最新模型列表，用 Space 勾选"),
+                ("disable", "[停用] 从 OpenCode 配置移除某个渠道"),
                 ("status", "[状态] 查看 OpenCode 实际配置"),
                 ("back", "[返回] 回到工具选择"),
             ], default="use")
@@ -1004,12 +1318,25 @@ def opencode_interactive() -> None:
                 return
             if choice in ("use", "configure"):
                 configure_opencode_channel()
+            elif choice == "multi":
+                choose_opencode_channels()
             elif choice == "refresh":
                 slug = choose_channel("OpenCode：刷新哪个渠道的模型？", runtime="opencode")
                 if slug:
                     refresh_models(slug, restart_app=False, runtime="opencode")
+            elif choice == "disable":
+                if not enabled:
+                    print_note("当前没有已启用的 OpenCode 渠道。", kind="warn")
+                else:
+                    slug = terminal_menu("停用哪个 OpenCode 渠道？", [
+                        (s, f"{data['channels'][s].get('name', s)} ({s})"
+                            f"{green('  [默认]') if opencode_provider_id(s) == info['provider_id'] else ''}")
+                        for s in enabled
+                    ])
+                    if slug:
+                        deactivate_opencode_channel(slug)
             elif choice == "status":
-                print_opencode_status()
+                print_opencode_status(strict=False)
             pause_after_action()
         except (KeyboardInterrupt, EOFError):
             print("\n已退出。")
@@ -1019,12 +1346,25 @@ def opencode_interactive() -> None:
 def engine_interactive() -> None:
     while True:
         try:
-            choice = terminal_menu("SGate 渠道切换器\n  选择操作范围", [
-                ("channels", "[渠道管理] 新增、删除、查看和检查渠道"),
-                ("codex", "[Codex] 选择模型、推理强度并启用"),
-                ("opencode", "[OpenCode] 选择模型、推理强度并启用"),
-                ("exit", "[退出] 关闭菜单"),
-            ], default="codex")
+            data = load_channels()
+            total = len(data.get("channels", {}))
+            codex_info = current_config_info()
+            codex_name = next(
+                (c.get("name", s) for s, c in data.get("channels", {}).items()
+                 if provider_id(s) == codex_info["provider_id"]),
+                "官方登录" if codex_info["provider_id"] == "openai" else codex_info["provider_id"],
+            )
+            oc_enabled = opencode_enabled_slugs()
+            choice = terminal_menu(
+                "SGate 渠道切换器\n"
+                f"渠道 {total} 个　|　Codex：{codex_name} · {codex_info['model']}"
+                f"　|　OpenCode：{len(oc_enabled)} 个已启用",
+                [
+                    ("channels", "[渠道管理] 新增、删除、总览和连接检查"),
+                    ("codex", "[Codex] 选择渠道、模型、思考强度并启用"),
+                    ("opencode", "[OpenCode] 多渠道启用、模型与思考强度"),
+                    ("exit", "[退出] 关闭菜单"),
+                ], default="codex")
             if choice in (None, "exit"):
                 return
             if choice == "channels":
@@ -1042,8 +1382,10 @@ def channel_management() -> None:
     while True:
         try:
             data = load_channels()
+            channels = data.get("channels", {})
             choice = terminal_menu(
-                f"渠道管理\n  已保存渠道：{len(data.get('channels', {}))} 个",
+                "渠道管理\n"
+                f"已保存 {len(channels)} 个渠道　|　API Key 存放于 macOS Keychain",
                 [
                     ("add", "[新增] 添加渠道、保存 API Key 并拉取模型"),
                     ("remove", "[删除] 永久删除渠道及 Keychain 密钥"),
@@ -1803,30 +2145,30 @@ def print_current_status() -> None:
     data = load_channels()
     provider_id_value = info["provider_id"]
     matched = next((c for c in data.get("channels", {}).values() if provider_id(c.get("slug", "")) == provider_id_value), None)
-    print("\n当前实际生效配置")
-    print(f"  CODEX_HOME：{CODEX_HOME}")
-    print(f"  config.toml：{CONFIG_PATH}")
-    print(f"  provider：{provider_id_value}")
+    print_heading("Codex 当前配置")
+    print_field("CODEX_HOME", CODEX_HOME)
+    print_field("config.toml", CONFIG_PATH)
+    print_field("provider", provider_id_value, tone="accent")
     if provider_id_value == "openai":
-        print("  渠道类型：官方登录")
+        print_field("渠道类型", "官方登录", tone="ok")
     elif matched:
-        print(f"  渠道名称：{matched.get('name', matched.get('slug'))} ({matched.get('slug')})")
-        print(f"  Base URL：{matched.get('base_url', '(未记录)')}")
+        print_field("渠道名称", f"{matched.get('name', matched.get('slug'))} ({matched.get('slug')})", tone="ok")
+        print_field("Base URL", matched.get("base_url", "(未记录)"))
     else:
         provider = info["provider"]
-        print("  渠道类型：未登记的已有 provider")
-        print(f"  名称：{provider.get('name', '(未设置)')}")
-        print(f"  Base URL：{provider.get('base_url', '(未设置)')}")
-        print("  提示：这通常是手工配置或旧版配置；脚本不会读取 auth.json 中的密钥。")
-    print(f"  Model：{info['model']}")
-    print(f"  Reasoning：{info['reasoning_effort']}")
-    print(f"  API Key 渠道记录：{len(data.get('channels', {}))} 个")
+        print_field("渠道类型", "未登记的已有 provider", tone="warn")
+        print_field("名称", provider.get("name", "(未设置)"))
+        print_field("Base URL", provider.get("base_url", "(未设置)"))
+        print_note("这通常是手工配置或旧版配置；脚本不会读取 auth.json 中的密钥。")
+    print_field("默认模型", info["model"], tone="accent")
+    print_field("思考强度", info["reasoning_effort"], tone="accent")
+    print_field("已存渠道", f"{len(data.get('channels', {}))} 个")
     cc = ccswitch_current_info()
     if cc:
-        print(f"  CC Switch 当前记录：{cc['name']} | provider={cc['provider_id']} | model={cc['model']}")
+        print_field("CC Switch", f"{cc['name']} | provider={cc['provider_id']} | model={cc['model']}")
         if ccswitch_is_running():
-            print("  CC Switch 状态：正在运行；以后在 CC Switch 中切换可能覆盖本文件。")
-    print("  结论：上述 provider/model/reasoning 就是 Codex 下一次启动时会使用的值。")
+            print_note("CC Switch 正在运行；以后在其中切换可能覆盖本文件。", kind="warn")
+    print_note("以上 provider/模型/强度就是 Codex 下次启动使用的值。", kind="ok")
 
 
 def list_channels() -> None:
@@ -1835,27 +2177,42 @@ def list_channels() -> None:
     data = load_channels()
     channels = data.get("channels", {})
     if not channels:
-        print("\n暂无由本脚本管理的 API Key 渠道。执行 `sgate add` 添加。")
+        print()
+        print_note("暂无由本脚本管理的渠道。执行 `sgate add` 或在渠道管理中新增。", kind="warn")
         return
     codex_actual = current_config_info()["provider_id"]
-    opencode_actual = current_opencode_info(strict=False)["provider_id"]
-    print("\n已保存的 API Key 渠道：")
+    opencode_info = current_opencode_info(strict=False)
+    opencode_managed = set(opencode_info["managed_providers"])
+    print_heading("已保存的渠道", f"共 {len(channels)} 个")
+    rows = []
     for slug, channel in channels.items():
-        marks = []
-        if provider_id(slug) == codex_actual:
-            marks.append("Codex")
-        if opencode_provider_id(slug) == opencode_actual:
-            marks.append("OpenCode")
-        mark = ",".join(marks) or "-"
-        count = len(channel.get("models", []))
+        codex_on = provider_id(slug) == codex_actual
+        oc_pid = opencode_provider_id(slug)
+        oc_default = oc_pid == opencode_info["provider_id"]
+        oc_on = oc_pid in opencode_managed
         codex_model = _channel_value(channel, "codex", "model") or "(未选)"
         codex_effort = _channel_value(channel, "codex", "reasoning_effort") or DEFAULT_EFFORT
         opencode_model = _channel_value(channel, "opencode", "model") or "(未选)"
         opencode_effort = _channel_value(channel, "opencode", "reasoning_effort") or DEFAULT_EFFORT
-        print(
-            f" {slug:20} {channel.get('name', slug)} | {mark:14} | "
-            f"Codex={codex_model}/{codex_effort} | OpenCode={opencode_model}/{opencode_effort} | models={count}"
-        )
+        if oc_default:
+            oc_state = green(f"{ICON_ON} 默认")
+        elif oc_on:
+            oc_state = cyan(f"{ICON_ON} 启用")
+        else:
+            oc_state = dim(f"{ICON_OFF} 未用")
+        rows.append([
+            channel.get("name", slug),
+            slug,
+            green(f"{ICON_ON} 启用") if codex_on else dim(f"{ICON_OFF} 未用"),
+            f"{codex_model}/{codex_effort}",
+            oc_state,
+            f"{opencode_model}/{opencode_effort}",
+            str(len(channel.get("models", []))),
+        ])
+    print_table(
+        ["名称", "slug", "Codex", "Codex 配置", "OpenCode", "OpenCode 配置", "模型"],
+        rows,
+    )
 
 
 def remove_channel(slug: str) -> None:
@@ -1883,14 +2240,10 @@ def remove_channel(slug: str) -> None:
         opencode_credentials_path(slug).unlink()
     except FileNotFoundError:
         pass
-    try:
-        opencode_credentials_path(slug).unlink()
-    except FileNotFoundError:
-        pass
     data["channels"].pop(slug, None)
     save_channels(data)
     keychain_delete(slug)
-    print(f"已删除渠道：{slug}")
+    print_note(f"已删除渠道 {slug} 及其 Keychain 密钥。", kind="ok")
 
 
 def doctor(slug: str | None) -> None:
@@ -1905,18 +2258,30 @@ def doctor(slug: str | None) -> None:
         die(f"渠道不存在：{slug}")
     key = keychain_get(slug)
     url = models_url(channel["base_url"])
-    print(f"检查：{channel['name']} ({slug})\nURL：{url}")
+    print_heading("渠道连接检查", f"{channel['name']} ({slug})")
+    print_field("请求地址", url)
     models, error = fetch_models(channel["base_url"], key)
     if error:
+        print_note(f"模型接口失败：{error}", kind="err")
         die(f"模型接口失败：{error}")
     channel["models"] = models
     channel["models_fetched_at"] = datetime.now(timezone.utc).isoformat()
     save_channels(data)
-    print(f"HTTP：200\n模型数量：{len(models)}")
-    print("Codex 当前模型：" + str(_channel_value(channel, "codex", "model") or "(未选择)"))
-    print("Codex 当前 reasoning：" + str(_channel_value(channel, "codex", "reasoning_effort") or DEFAULT_EFFORT))
-    print("OpenCode 当前模型：" + str(_channel_value(channel, "opencode", "model") or "(未选择)"))
-    print("OpenCode 当前 reasoning：" + str(_channel_value(channel, "opencode", "reasoning_effort") or DEFAULT_EFFORT))
+    print_field("HTTP", "200", tone="ok")
+    print_field("模型数量", f"{len(models)} 个", tone="ok")
+    print()
+    print_table(
+        ["工具", "默认模型", "思考强度"],
+        [
+            ["Codex",
+             str(_channel_value(channel, "codex", "model") or "(未选择)"),
+             str(_channel_value(channel, "codex", "reasoning_effort") or DEFAULT_EFFORT)],
+            ["OpenCode",
+             str(_channel_value(channel, "opencode", "model") or "(未选择)"),
+             str(_channel_value(channel, "opencode", "reasoning_effort") or DEFAULT_EFFORT)],
+        ],
+    )
+    print_note("模型缓存已更新，可在各工具菜单中重新勾选。", kind="ok")
 
 
 def executable_version(path: str) -> str:
@@ -2161,11 +2526,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_run = sub.add_parser("run", help="用当前全局配置启动 standalone codex")
     p_run.add_argument("args", nargs=argparse.REMAINDER)
 
-    p_oc = sub.add_parser("opencode", help="交互配置 OpenCode 渠道")
-    p_oc.add_argument("action", nargs="?", choices=("use", "configure", "status"), default=None)
-    p_oc.add_argument("slug", nargs="?")
+    p_oc = sub.add_parser("opencode", help="交互配置 OpenCode 渠道（支持多渠道同时启用）")
+    p_oc.add_argument(
+        "action", nargs="?",
+        choices=("use", "add", "configure", "status", "disable", "sync"),
+        default=None,
+        help="use=设为默认；add=启用但不设默认；disable=移除；sync=一次性指定全部启用渠道",
+    )
+    p_oc.add_argument("slug", nargs="*", help="渠道 slug；sync 可传多个")
     p_oc.add_argument("--model")
     p_oc.add_argument("--reasoning", choices=EFFORTS)
+    p_oc.add_argument("--default", dest="default_slug", help="sync 时指定默认渠道")
 
     p_token = sub.add_parser("token", help=argparse.SUPPRESS)
     p_token.add_argument("slug")
@@ -2210,12 +2581,24 @@ def main() -> None:
     elif args.command == "run":
         os.execvp("codex", ["codex", *args.args])
     elif args.command == "opencode":
+        slugs = args.slug or []
         if args.action == "status":
-            print_opencode_status()
-        elif args.action == "use":
-            if not args.slug:
-                die("OpenCode use 需要渠道 slug")
-            select_opencode_channel(args.slug, model=args.model, effort=args.reasoning)
+            print_opencode_status(strict=False)
+        elif args.action in ("use", "add"):
+            if not slugs:
+                die(f"OpenCode {args.action} 需要渠道 slug")
+            select_opencode_channel(
+                slugs[0], model=args.model, effort=args.reasoning,
+                make_default=(args.action == "use"),
+            )
+        elif args.action == "disable":
+            if not slugs:
+                die("OpenCode disable 需要渠道 slug")
+            deactivate_opencode_channel(slugs[0])
+        elif args.action == "sync":
+            if not slugs:
+                die("OpenCode sync 需要至少一个渠道 slug")
+            sync_opencode_channels(slugs, args.default_slug)
         elif args.action == "configure":
             configure_opencode_channel()
         else:
