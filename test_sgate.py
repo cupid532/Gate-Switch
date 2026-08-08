@@ -168,6 +168,62 @@ class SGateTests(unittest.TestCase):
         self.assertEqual(sgate.opencode_credentials_path("test").read_text(encoding="utf-8").strip(), "secret-for-test")
         self.assertEqual(sgate.current_opencode_info()["reasoning_effort"], "xhigh")
 
+    def test_opencode_channel_preserves_image_model_metadata(self) -> None:
+        data = json.loads(sgate.CHANNELS_PATH.read_text(encoding="utf-8"))
+        data["channels"]["test"]["models"] = ["model-2", "text-only"]
+        data["channels"]["test"]["model_metadata"] = {
+            "model-2": {
+                "input_modalities": ["text", "image"],
+                "output_modalities": ["text"],
+                "reasoning": True,
+                "tool_call": True,
+            },
+            "text-only": {
+                "input_modalities": ["text"],
+                "output_modalities": ["text"],
+                "reasoning": False,
+            },
+        }
+        data["channels"]["test"]["opencode_selected_models"] = ["model-2", "text-only"]
+        sgate.save_channels(data)
+
+        sgate.select_opencode_channel(
+            "test", model="model-2", effort="high",
+            selected_models=["model-2", "text-only"],
+        )
+        config = json.loads(sgate.OPENCODE_CONFIG_PATH.read_text(encoding="utf-8"))
+        models = config["provider"]["sgate_test"]["models"]
+        self.assertTrue(models["model-2"]["attachment"])
+        self.assertEqual(models["model-2"]["modalities"], {
+            "input": ["text", "image"], "output": ["text"]
+        })
+        self.assertNotIn("attachment", models["text-only"])
+        self.assertFalse(models["text-only"]["reasoning"])
+
+    def test_fetch_models_preserves_openai_model_metadata(self) -> None:
+        class Response:
+            status = 200
+
+            def read(self, _limit: int) -> bytes:
+                return json.dumps({"data": [
+                    {"id": "gpt-5.6-luna", "input_modalities": ["text", "image"],
+                     "output_modalities": ["text"], "reasoning": True},
+                    {"id": "text-only", "input_modalities": ["text"]},
+                ]}).encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        with patch.object(sgate.urllib.request, "urlopen", return_value=Response()):
+            models, error = sgate.fetch_models("https://example.test/v1", "secret")
+        self.assertIsNone(error)
+        self.assertEqual(models, ["gpt-5.6-luna", "text-only"])
+        self.assertEqual(models.metadata["gpt-5.6-luna"]["input_modalities"], ["text", "image"])
+        self.assertNotIn("output_modalities", models.metadata["text-only"])
+
     def test_interactive_add_defers_tool_specific_choices(self) -> None:
         args = type("Args", (), {
             "name": "Deferred",

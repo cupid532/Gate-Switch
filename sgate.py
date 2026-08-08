@@ -61,6 +61,19 @@ CCSWITCH_DB = Path.home() / ".cc-switch" / "cc-switch.db"
 DEFAULT_MODEL = "gpt-5.6"
 DEFAULT_EFFORT = "high"
 EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
+
+
+class ModelList(list[str]):
+    """Model IDs with the metadata returned by an OpenAI-compatible /models API.
+
+    The list interface keeps compatibility with the existing interactive
+    selectors and callers that only need model IDs, while ``metadata`` lets
+    OpenCode preserve capabilities such as image input when writing config.
+    """
+
+    def __init__(self, values: list[str] | None = None, metadata: dict[str, dict[str, Any]] | None = None):
+        super().__init__(values or [])
+        self.metadata = metadata or {}
 CLAUDE_EFFORTS = ("low", "medium", "high")
 CLAUDE_ROLES = ("opus", "sonnet", "haiku")
 CLAUDE_MANAGED_ENV = (
@@ -2088,6 +2101,37 @@ def opencode_provider_block(channel: dict[str, Any]) -> dict[str, Any]:
         str(_channel_value(channel, "opencode", "model") or DEFAULT_MODEL)
     ]
     variants = {effort: {"reasoningEffort": effort} for effort in efforts}
+    metadata = channel.get("model_metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    model_configs: dict[str, dict[str, Any]] = {}
+    for model in models:
+        info = metadata.get(model)
+        info = info if isinstance(info, dict) else {}
+        model_config: dict[str, Any] = {
+            "name": model,
+            # Keep the historical defaults for channels created before model
+            # metadata was persisted. Explicit API metadata takes precedence.
+            "reasoning": bool(info.get("reasoning", True)),
+            "tool_call": bool(info.get("tool_call", True)),
+            "variants": variants,
+        }
+        input_modalities = info.get("input_modalities")
+        output_modalities = info.get("output_modalities")
+        supports_image = (
+            isinstance(input_modalities, list) and "image" in input_modalities
+        ) or info.get("attachment") is True
+        if supports_image:
+            input_values = [str(value) for value in input_modalities] if isinstance(input_modalities, list) else ["text", "image"]
+            if "image" not in input_values:
+                input_values.append("image")
+            model_config["attachment"] = True
+            model_config["modalities"] = {
+                "input": input_values,
+                "output": [str(value) for value in output_modalities]
+                if isinstance(output_modalities, list) and output_modalities
+                else ["text"],
+            }
+        model_configs[model] = model_config
     return {
         "name": channel.get("name", channel["slug"]),
         "npm": "@ai-sdk/openai-compatible",
@@ -2096,15 +2140,7 @@ def opencode_provider_block(channel: dict[str, Any]) -> dict[str, Any]:
             "baseURL": str(channel["base_url"]).rstrip("/") + "/v1" if not str(channel["base_url"]).rstrip("/").endswith("/v1") else str(channel["base_url"]).rstrip("/"),
             "setCacheKey": True,
         },
-        "models": {
-            model: {
-                "name": model,
-                "reasoning": True,
-                "tool_call": True,
-                "variants": variants,
-            }
-            for model in models
-        },
+        "models": model_configs,
     }
 
 
@@ -2818,7 +2854,7 @@ def models_url(base_url: str) -> str:
     return base + "/models"
 
 
-def fetch_models(base_url: str, api_key: str) -> tuple[list[str], str | None]:
+def fetch_models(base_url: str, api_key: str) -> tuple[ModelList, str | None]:
     url = models_url(base_url)
     request = urllib.request.Request(
         url,
@@ -2832,18 +2868,18 @@ def fetch_models(base_url: str, api_key: str) -> tuple[list[str], str | None]:
         with urllib.request.urlopen(request, timeout=20) as response:
             raw = response.read(8_000_000)
             if response.status < 200 or response.status >= 300:
-                return [], f"HTTP {response.status}"
+                return ModelList(), f"HTTP {response.status}"
     except urllib.error.HTTPError as exc:
         body = exc.read(1000).decode("utf-8", "replace").replace("\n", " ")
-        return [], f"HTTP {exc.code}: {body[:300]}"
+        return ModelList(), f"HTTP {exc.code}: {body[:300]}"
     except urllib.error.URLError as exc:
-        return [], f"网络错误：{exc.reason}"
+        return ModelList(), f"网络错误：{exc.reason}"
     except TimeoutError:
-        return [], "请求超时"
+        return ModelList(), "请求超时"
     try:
         obj = json.loads(raw)
     except json.JSONDecodeError:
-        return [], "返回内容不是 JSON"
+        return ModelList(), "返回内容不是 JSON"
 
     if isinstance(obj, list):
         items = obj
@@ -2852,16 +2888,32 @@ def fetch_models(base_url: str, api_key: str) -> tuple[list[str], str | None]:
     else:
         items = []
     names: list[str] = []
+    metadata: dict[str, dict[str, Any]] = {}
     for item in items if isinstance(items, list) else []:
         if isinstance(item, str):
             name = item
+            info: dict[str, Any] = {}
         elif isinstance(item, dict):
             name = item.get("id") or item.get("model") or item.get("name")
+            info = {
+                key: item[key]
+                for key in (
+                    "input_modalities", "output_modalities", "reasoning",
+                    "tool_call", "attachment", "supported_reasoning_efforts",
+                )
+                if key in item
+            }
         else:
             name = None
-        if isinstance(name, str) and name.strip() and name.strip() not in names:
-            names.append(name.strip())
-    return sorted(names, key=str.casefold), None
+            info = {}
+        if isinstance(name, str) and name.strip():
+            model = name.strip()
+            if model not in names:
+                names.append(model)
+            if info:
+                metadata.setdefault(model, {}).update(info)
+    ordered = sorted(names, key=str.casefold)
+    return ModelList(ordered, {model: metadata[model] for model in ordered if model in metadata}), None
 
 
 def _model_sort_key(name: str, default: str | None) -> tuple[Any, ...]:
@@ -3364,7 +3416,8 @@ def add_channel(args: argparse.Namespace, *, configure: bool = True) -> None:
         "slug": slug, "name": name, "base_url": base_url,
         "model": model, "reasoning_effort": effort,
         "selected_models": selected_models, "selected_efforts": selected_efforts,
-        "models": models, "models_fetched_at": datetime.now(timezone.utc).isoformat(),
+        "models": list(models), "model_metadata": dict(getattr(models, "metadata", {})),
+        "models_fetched_at": datetime.now(timezone.utc).isoformat(),
         "created_at": old.get("created_at") if old else datetime.now(timezone.utc).isoformat(),
         "enabled": bool(old and old.get("enabled")),
         "opencode_enabled": bool(old and old.get("opencode_enabled")),
@@ -3401,7 +3454,8 @@ def refresh_models(
     models, error = fetch_models(channel["base_url"], key)
     if error:
         die(f"模型拉取失败：{error}")
-    channel["models"] = models
+    channel["models"] = list(models)
+    channel["model_metadata"] = dict(getattr(models, "metadata", {}))
     channel["models_fetched_at"] = datetime.now(timezone.utc).isoformat()
     selected_models = _normalized_values(_channel_value(channel, runtime, "selected_models"))
     default_model = str(_channel_value(channel, runtime, "model") or DEFAULT_MODEL)
@@ -3693,7 +3747,8 @@ def doctor(slug: str | None) -> None:
     if error:
         print_note(f"模型接口失败：{error}", kind="err")
         die(f"模型接口失败：{error}")
-    channel["models"] = models
+    channel["models"] = list(models)
+    channel["model_metadata"] = dict(getattr(models, "metadata", {}))
     channel["models_fetched_at"] = datetime.now(timezone.utc).isoformat()
     save_channels(data)
     print_field("HTTP", "200", tone="ok")
