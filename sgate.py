@@ -32,6 +32,7 @@ except ModuleNotFoundError:  # macOS systems that still ship Python 3.8/3.9
     tomllib = None
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -78,9 +79,12 @@ CLAUDE_EFFORTS = ("low", "medium", "high")
 CLAUDE_ROLES = ("opus", "sonnet", "haiku")
 CLAUDE_MANAGED_ENV = (
     "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_SMALL_FAST_MODEL",
     "ANTHROPIC_DEFAULT_OPUS_MODEL",
     "ANTHROPIC_DEFAULT_SONNET_MODEL",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS",
 )
 CLAUDE_TAKEOVER_KEY = "claude_code"
 # Journal paths are deliberately closed over the settings SGate knows how to
@@ -92,6 +96,9 @@ _CLAUDE_JOURNAL_PATHS = frozenset({
     "/effortLevel",
     "/apiKeyHelper",
     "/env/ANTHROPIC_BASE_URL",
+    "/env/ANTHROPIC_MODEL",
+    "/env/ANTHROPIC_SMALL_FAST_MODEL",
+    "/env/CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS",
     "/env/ANTHROPIC_DEFAULT_OPUS_MODEL",
     "/env/ANTHROPIC_DEFAULT_SONNET_MODEL",
     "/env/ANTHROPIC_DEFAULT_HAIKU_MODEL",
@@ -100,7 +107,6 @@ _CLAUDE_JOURNAL_PATHS = frozenset({
     # the current planner.
     "/env/ANTHROPIC_API_KEY",
     "/env/ANTHROPIC_AUTH_TOKEN",
-    "/env/ANTHROPIC_MODEL",
     "/env/ANTHROPIC_DEFAULT_FABLE_MODEL",
     "/env/CLAUDE_CODE_EFFORT_LEVEL",
 })
@@ -1285,6 +1291,22 @@ def _anthropic_profile_sections(profile: dict[str, Any]) -> tuple[dict[str, Any]
     return anthropic, runtime
 
 
+def _claude_gateway_is_first_party(base_url: str) -> bool:
+    """Return whether the URL is Anthropic's own API host.
+
+    Claude Code adds experimental ``anthropic-beta`` features by default.  A
+    third-party gateway may forward those fields/headers to an upstream that
+    does not understand them, producing an opaque HTTP 400 before model
+    routing.  The compatibility switch is only needed for non-Anthropic
+    hosts; users of the first-party API keep the normal feature set.
+    """
+    try:
+        hostname = (urlsplit(base_url).hostname or "").rstrip(".").casefold()
+    except ValueError:
+        return False
+    return hostname == "api.anthropic.com"
+
+
 def compile_claude_managed_values(
     profile: dict[str, Any], capabilities: dict[str, Any] | None = None,
 ) -> ClaudeManagedPlan:
@@ -1380,11 +1402,23 @@ def compile_claude_managed_values(
     if diagnostics:
         return ClaudeManagedPlan({}, (), tuple(diagnostics), False)
     helper = f"{shlex.quote(str(SCRIPT_PATH))} claude-token {shlex.quote(secret_ref)}"
+    # Claude Code's built-in aliases are provider-dependent.  In particular,
+    # custom gateways commonly expose OpenAI-style IDs (for example
+    # ``gpt-5.6-sol``) rather than the literal ``sonnet``/``opus`` names.
+    # Keep the role alias in ``model`` for the UI, but also set the documented
+    # ANTHROPIC_MODEL override to the exact gateway ID.  Without this explicit
+    # value some Claude Code versions send the literal alias to the gateway,
+    # which either returns model_not_found or a generic 400 on every request.
     pointer_values = {
         "/model": default_role,
         "/effortLevel": effort,
         "/apiKeyHelper": helper,
         "/env/ANTHROPIC_BASE_URL": base_url,
+        "/env/ANTHROPIC_MODEL": normalized_map[default_role],
+        "/env/ANTHROPIC_SMALL_FAST_MODEL": normalized_map["haiku"],
+        "/env/CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": (
+            "" if _claude_gateway_is_first_party(base_url) else "1"
+        ),
         "/env/ANTHROPIC_DEFAULT_OPUS_MODEL": normalized_map["opus"],
         "/env/ANTHROPIC_DEFAULT_SONNET_MODEL": normalized_map["sonnet"],
         "/env/ANTHROPIC_DEFAULT_HAIKU_MODEL": normalized_map["haiku"],
@@ -1396,6 +1430,11 @@ def compile_claude_managed_values(
         "apiKeyHelper": helper,
         "env": {
             "ANTHROPIC_BASE_URL": base_url,
+            "ANTHROPIC_MODEL": normalized_map[default_role],
+            "ANTHROPIC_SMALL_FAST_MODEL": normalized_map["haiku"],
+            "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": (
+                "" if _claude_gateway_is_first_party(base_url) else "1"
+            ),
             "ANTHROPIC_DEFAULT_OPUS_MODEL": normalized_map["opus"],
             "ANTHROPIC_DEFAULT_SONNET_MODEL": normalized_map["sonnet"],
             "ANTHROPIC_DEFAULT_HAIKU_MODEL": normalized_map["haiku"],
@@ -1613,7 +1652,7 @@ def _apply_claude_plan(
     managed_now = list(plan.managed_paths)
     for path in (
         "/env/ANTHROPIC_API_KEY", "/env/ANTHROPIC_AUTH_TOKEN",
-        "/env/ANTHROPIC_MODEL", "/env/ANTHROPIC_DEFAULT_FABLE_MODEL",
+        "/env/ANTHROPIC_DEFAULT_FABLE_MODEL",
         "/env/CLAUDE_CODE_EFFORT_LEVEL",
     ):
         if not _is_missing(_pointer_get(settings, path)) and path not in managed_now:

@@ -51,7 +51,7 @@ sgate --help
 - OpenCode 使用合法的 `provider`、`model` 和 `agent.build.variant` 配置，保留 `minimal`、`low`、`medium`、`high`、`xhigh` 思考强度。
 - 状态、总览、连接检查均为带颜色的分栏表格输出；管道输出、`NO_COLOR` 或非 TTY 环境自动降级为纯文本。
 - OpenCode API Key 仍以 macOS Keychain 为密钥源；启用 OpenCode 时写入每渠道独立、权限为 `0600` 的运行时引用文件，并通过 `{file:...}` 引用，不写入 `opencode.json`；停用或删除渠道时清理该文件。
-- Claude Code 使用独立的 Anthropic 配置（`protocols.anthropic`），通过 macOS Keychain 和 `apiKeyHelper` 动态读取密钥；不会从 OpenAI Base URL 猜 Anthropic endpoint，也不会写 `ANTHROPIC_MODEL`。Anthropic Base URL 必须显式配置为 gateway root（例如 `https://gateway.example`，不能以 `/v1` 结尾），`auth.secret_ref` 必须是 Keychain slug 字符串。
+- Claude Code 使用独立的 Anthropic 配置（`protocols.anthropic`），通过 macOS Keychain 和 `apiKeyHelper` 动态读取密钥；不会从 OpenAI Base URL 猜 Anthropic endpoint。启用自定义网关时会将默认 alias 映射为明确的 `ANTHROPIC_MODEL`，并设置 `ANTHROPIC_SMALL_FAST_MODEL`，避免网关收到字面量 `sonnet`/`opus`/`haiku`；同时设置 `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1`，避免第三方网关因 Claude Code 的 beta header/字段返回 400。Anthropic Base URL 必须显式配置为 gateway root（例如 `https://gateway.example`，不能以 `/v1` 结尾），`auth.secret_ref` 必须是 Keychain slug 字符串。
 - Claude Desktop JSON 只读：SGate 仅读取 MCP 信息，Code tab 复用 Claude Code settings；Desktop Chat/Cowork 的账户与 bearer-only 认证由官方应用管理，SGate 不写不受支持的 provider 字段。
 
 ## 交互按键
@@ -182,7 +182,7 @@ ChatGPT.app 和 OpenCode 都不会让已经运行的会话热切换配置。切�
 
 Codex 一次只能有一个生效 provider，因此 Codex 渠道是单选。OpenCode 的 `provider` 是一个映射，可以同时保留多个渠道，`model` 只决定默认值；所以 OpenCode 支持多渠道并存，启用新渠道不会移除已有渠道。停用默认渠道时，若仍有其他已启用渠道，会自动提升其中一个为默认；若已无渠道，则恢复 SGate 接管前的原始默认配置。
 
-Claude Code 的渠道切换会更新独立 Anthropic Base URL、`model` alias、`effortLevel`、`ANTHROPIC_DEFAULT_*_MODEL` 三项角色映射，并通过 `apiKeyHelper` 从 Keychain 读取当前渠道密钥。每次接管写入受管 JSON pointer journal：停用时仅在本地值仍等于 SGate 上次 applied 值时恢复 before；冲突保留并报告。旧版 `claude_fallback` 仅标记为 legacy/ambiguous，不宣称 exact restore。Claude Desktop 的 JSON 只读，不写 provider 字段。
+Claude Code 的渠道切换会更新独立 Anthropic Base URL、`model` alias、`effortLevel`、精确的 `ANTHROPIC_MODEL`/`ANTHROPIC_SMALL_FAST_MODEL`、`ANTHROPIC_DEFAULT_*_MODEL` 三项角色映射，并通过 `apiKeyHelper` 从 Keychain 读取当前渠道密钥。第三方网关默认设置 `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1`，降低新版本 Claude Code 发送实验性 beta 字段导致的 400；直连 `api.anthropic.com` 时保留官方能力。每次接管写入受管 JSON pointer journal：停用时仅在本地值仍等于 SGate 上次 applied 值时恢复 before；冲突保留并报告。旧版 `claude_fallback` 仅标记为 legacy/ambiguous，不宣称 exact restore。Claude Desktop 的 JSON 只读，不写 provider 字段。
 
 为了兼容旧版 `codex-channel`，SGate 会继续读取原来的渠道文件、Keychain 服务名以及旧备份，不需要重新录入 API Key。
 

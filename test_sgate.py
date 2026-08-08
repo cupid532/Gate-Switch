@@ -395,9 +395,37 @@ class SGateTests(unittest.TestCase):
         self.assertTrue(plan.supported)
         self.assertEqual(plan.desired["/model"], "sonnet")
         self.assertEqual(plan.desired["/env/ANTHROPIC_DEFAULT_OPUS_MODEL"], "gw-opus")
-        self.assertNotIn("/env/ANTHROPIC_MODEL", plan.desired)
+        self.assertEqual(plan.desired["/env/ANTHROPIC_MODEL"], "gw-sonnet")
+        self.assertEqual(plan.desired["/env/ANTHROPIC_SMALL_FAST_MODEL"], "gw-haiku")
+        self.assertEqual(plan.desired["/env/CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"], "1")
         profile["runtimes"]["claude_code"]["model_map"].pop("haiku")
         self.assertFalse(sgate.compile_claude_managed_values(profile).supported)
+
+    def test_claude_custom_gateway_uses_exact_model_and_disables_experimental_betas(self) -> None:
+        profile = {
+            "slug": "test",
+            "protocols": {"anthropic": {"base_url": "https://api.codelee.de"}},
+            "runtimes": {"claude_code": {"default_role": "sonnet", "effort": "high", "model_map": {
+                "opus": "gpt-5.6-luna", "sonnet": "gpt-5.6-sol", "haiku": "gpt-5.6-terra"
+            }}},
+        }
+        plan = sgate.compile_claude_managed_values(profile)
+        self.assertTrue(plan.supported)
+        self.assertEqual(plan.desired["/env/ANTHROPIC_MODEL"], "gpt-5.6-sol")
+        self.assertEqual(plan.desired["/env/ANTHROPIC_SMALL_FAST_MODEL"], "gpt-5.6-terra")
+        self.assertEqual(plan.desired["/env/CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"], "1")
+
+    def test_claude_first_party_keeps_experimental_betas_enabled(self) -> None:
+        profile = {
+            "slug": "test",
+            "protocols": {"anthropic": {"base_url": "https://api.anthropic.com"}},
+            "runtimes": {"claude_code": {"default_role": "sonnet", "effort": "high", "model_map": {
+                "opus": "claude-opus-5", "sonnet": "claude-sonnet-5", "haiku": "claude-haiku-5"
+            }}},
+        }
+        plan = sgate.compile_claude_managed_values(profile)
+        self.assertTrue(plan.supported)
+        self.assertEqual(plan.desired["/env/CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"], "")
 
     def test_claude_shared_openai_url_is_not_inferred(self) -> None:
         channel = json.loads(sgate.CHANNELS_PATH.read_text(encoding="utf-8"))["channels"]["test"]
@@ -446,7 +474,9 @@ class SGateTests(unittest.TestCase):
         self.assertEqual(settings["hooks"], original["hooks"])
         self.assertEqual(env["KEEP_ME"], "yes")
         self.assertNotIn("ANTHROPIC_AUTH_TOKEN", env)
-        self.assertNotIn("ANTHROPIC_MODEL", env)
+        self.assertEqual(env["ANTHROPIC_MODEL"], "gw-opus")
+        self.assertEqual(env["ANTHROPIC_SMALL_FAST_MODEL"], "gw-haiku")
+        self.assertEqual(env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"], "1")
         self.assertNotIn("CLAUDE_CODE_EFFORT_LEVEL", env)
         self.assertEqual(settings["model"], "opus")
         self.assertEqual(settings["effortLevel"], "high")
