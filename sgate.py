@@ -267,6 +267,10 @@ def run_checked(argv: list[str], *, capture: bool = True) -> subprocess.Complete
 def keychain_set(slug: str, value: str) -> None:
     if sys.platform != "darwin":
         die("此脚本使用 macOS Keychain，只支持 macOS。")
+    # macOS `security` has no portable stdin mode for add-generic-password;
+    # -w therefore appears briefly in argv.  It is never logged or persisted
+    # in SGate files, and callers should avoid invoking this while observable
+    # process-list inspection is possible.
     run_checked([
         "security", "add-generic-password", "-a", keychain_account(),
         "-s", keychain_service(slug), "-w", value, "-U",
@@ -290,14 +294,21 @@ def keychain_get(slug: str) -> str:
     return value
 
 
-def keychain_delete(slug: str) -> None:
+def keychain_delete(slug: str) -> bool:
+    """Delete a channel secret and report whether macOS Keychain accepted it.
+
+    ``security`` returns a non-zero status when the item is already absent or
+    cannot be removed.  Callers must not claim that the secret was deleted
+    without checking that status.
+    """
     if sys.platform != "darwin":
-        return
-    subprocess.run(
+        return True
+    proc = subprocess.run(
         ["security", "delete-generic-password", "-a", keychain_account(),
          "-s", keychain_service(slug)],
         text=True, capture_output=True,
     )
+    return proc.returncode == 0
 
 
 def slugify(value: str) -> str:
@@ -979,13 +990,43 @@ def opencode_write_config(config: dict[str, Any]) -> None:
 
 
 def opencode_config_is_valid() -> bool:
+    """Return whether the portions SGate mutates have the expected shape.
+
+    A top-level object alone is not enough: writing through a string-valued
+    ``provider`` or ``agent.build`` would otherwise fail after registry state
+    and runtime credentials have already been changed.
+    """
     if not OPENCODE_CONFIG_PATH.exists():
         return True
     try:
         value = json.loads(OPENCODE_CONFIG_PATH.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return False
-    return isinstance(value, dict)
+    if not isinstance(value, dict):
+        return False
+    if "provider" in value and not isinstance(value.get("provider"), dict):
+        return False
+    if "agent" in value:
+        agent = value.get("agent")
+        if not isinstance(agent, dict):
+            return False
+        if "build" in agent and not isinstance(agent.get("build"), dict):
+            return False
+    return True
+
+
+def validate_opencode_config_shape(config: dict[str, Any]) -> None:
+    """Fail closed before Keychain, registry, or OpenCode writes."""
+    if not isinstance(config, dict):
+        die(f"OpenCode 配置必须是 JSON 对象：{OPENCODE_CONFIG_PATH}")
+    if "provider" in config and not isinstance(config.get("provider"), dict):
+        die("OpenCode 配置的 provider 必须是 JSON 对象；已停止，未修改任何配置。")
+    if "agent" in config:
+        agent = config.get("agent")
+        if not isinstance(agent, dict):
+            die("OpenCode 配置的 agent 必须是 JSON 对象；已停止，未修改任何配置。")
+        if "build" in agent and not isinstance(agent.get("build"), dict):
+            die("OpenCode 配置的 agent.build 必须是 JSON 对象；已停止，未修改任何配置。")
 
 
 def opencode_credentials_path(slug: str) -> Path:
@@ -1294,6 +1335,27 @@ def compile_claude_managed_values(
     return ClaudeManagedPlan(desired, tuple(pointer_values), (), True, pointer_values)
 
 
+def claude_channel_base_url(channel: dict[str, Any]) -> str:
+    """Resolve the Anthropic URL already owned by the selected control channel.
+
+    Claude Code's ``ANTHROPIC_BASE_URL`` is the gateway root; Claude itself
+    appends ``/v1/messages``. A channel created by older SGate versions only
+    has the shared OpenAI URL, so inherit that root by removing a terminal
+    OpenAI ``/v1`` suffix instead of prompting again during tool selection.
+    """
+    anthropic, _ = _anthropic_profile_sections(channel)
+    explicit = anthropic.get("base_url")
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip().rstrip("/")
+    shared = channel.get("base_url")
+    if isinstance(shared, str) and shared.strip():
+        value = shared.strip().rstrip("/")
+        if value.casefold().endswith("/v1"):
+            value = value[:-3].rstrip("/")
+        return value
+    return ""
+
+
 def _claude_profile(
     channel: dict[str, Any], *, anthropic_base_url: str | None = None,
     model_map: dict[str, str] | None = None, default_role: str | None = None,
@@ -1301,8 +1363,15 @@ def _claude_profile(
 ) -> dict[str, Any]:
     profile = json.loads(json.dumps(channel, ensure_ascii=False))
     anthropic, runtime = _anthropic_profile_sections(profile)
-    if anthropic_base_url is not None:
-        anthropic["base_url"] = anthropic_base_url
+    # The control-channel profile is the source of truth. A caller may supply
+    # an explicit URL for non-interactive migration, but the interactive path
+    # never asks again once the channel has a saved URL (or shared base URL).
+    if anthropic_base_url is not None and str(anthropic_base_url).strip():
+        anthropic["base_url"] = str(anthropic_base_url).strip()
+    elif not str(anthropic.get("base_url") or "").strip():
+        inherited = claude_channel_base_url(channel)
+        if inherited:
+            anthropic["base_url"] = inherited
     if model_map is not None:
         # The Anthropic catalog is a list; the runtime role mapping is the
         # separate authoritative dictionary.
@@ -1353,19 +1422,31 @@ def _secret_before_reference(path: str, before: Any) -> Any:
 
 
 def _journal_value(value: Any) -> Any:
+    """Serialize a JSON value; new entries carry explicit existence bits."""
     if _is_missing(value):
         return {"__sgate_journal_missing__": True}
     return json.loads(json.dumps(value, ensure_ascii=False))
 
 
 def _journal_decode(value: Any) -> Any:
+    # Legacy journals used a marker object.  New entries prefer the explicit
+    # *_exists fields below, avoiding collisions with a legitimate user dict.
     if isinstance(value, dict) and value.get("__sgate_journal_missing__") is True:
         return _MISSING
     return value
 
 
+def _journal_entry_value(entry: dict[str, Any], name: str) -> Any:
+    exists_key = f"{name}_exists"
+    if exists_key in entry:
+        if entry.get(exists_key) is not True:
+            return _MISSING
+        return json.loads(json.dumps(entry.get(name), ensure_ascii=False))
+    return _journal_decode(entry.get(name, _MISSING))
+
+
 def _journal_before_value(entry: dict[str, Any]) -> Any:
-    before = _journal_decode(entry.get("before", _MISSING))
+    before = _journal_entry_value(entry, "before")
     if isinstance(before, dict) and before.get("keychain_restore_ref"):
         slug = str(before["keychain_restore_ref"])
         allowed = {CLAUDE_ORIGINAL_KEY_SLUG, f"{CLAUDE_ORIGINAL_KEY_SLUG}-api-key"}
@@ -1420,7 +1501,7 @@ def _validate_claude_takeover(data: dict[str, Any]) -> dict[str, Any] | None:
             die(f"Claude journal path 非 SGate 管理范围或重复：{path}")
         if "before" not in entry or "applied" not in entry:
             die(f"Claude journal entry 缺少 before/applied：{path}")
-        before = _journal_decode(entry["before"])
+        before = _journal_entry_value(entry, "before")
         if isinstance(before, dict) and "keychain_restore_ref" in before:
             if set(before) != {"keychain_restore_ref"} or str(before["keychain_restore_ref"]) not in allowed_refs:
                 die(f"Claude journal 的 Keychain restore reference 非 SGate 创建：{path}")
@@ -1435,7 +1516,7 @@ def _takeover_conflicts(settings: dict[str, Any], takeover: dict[str, Any] | Non
     for entry in takeover.get("entries", []):
         path = entry["path"]
         local = _pointer_get(settings, path)
-        applied = _journal_decode(entry["applied"])
+        applied = _journal_entry_value(entry, "applied")
         before = _journal_before_value(entry)
         if local != applied and local != before:
             conflicts.append(path)
@@ -1486,12 +1567,15 @@ def _apply_claude_plan(
         if entry is None:
             entry = {
                 "path": path,
+                "before_exists": not _is_missing(before),
                 "before": _journal_value(_secret_before_reference(path, before)),
+                "applied_exists": not _is_missing(desired),
                 "applied": _journal_value(desired),
             }
             entries.append(entry)
             by_path[path] = entry
         else:
+            entry["applied_exists"] = not _is_missing(desired)
             entry["applied"] = _journal_value(desired)
         if _is_missing(desired):
             _pointer_delete(settings, path)
@@ -1514,7 +1598,7 @@ def _restore_claude_takeover(
             conflicts.append(f"{path} (unsupported journal path)")
             continue
         local = _pointer_get(settings, path)
-        applied = _journal_decode(entry.get("applied", _MISSING))
+        applied = _journal_entry_value(entry, "applied")
         try:
             before = _journal_before_value(entry)
         except SystemExit:
@@ -1552,11 +1636,17 @@ def claude_current_info() -> dict[str, Any]:
 
 
 def claude_provider_models(channel: dict[str, Any]) -> list[str]:
+    """Return usable Claude model candidates without mistaking partial maps for catalogs."""
     anthropic, runtime = _anthropic_profile_sections(channel)
+    catalog = _normalized_values(anthropic.get("models"))
     model_map = runtime.get("model_map")
-    if not isinstance(model_map, dict):
-        return _normalized_values(anthropic.get("models"))
-    return [str(model_map[role]) for role in CLAUDE_ROLES if isinstance(model_map.get(role), str) and model_map.get(role)]
+    if isinstance(model_map, dict) and all(
+        isinstance(model_map.get(role), str) and model_map.get(role).strip()
+        for role in CLAUDE_ROLES
+    ):
+        mapped = [str(model_map[role]).strip() for role in CLAUDE_ROLES]
+        return list(dict.fromkeys(mapped + catalog))
+    return catalog
 
 
 def _parse_model_map(values: list[str] | None, map_all: str | None = None) -> dict[str, str] | None:
@@ -1627,29 +1717,49 @@ def select_claude_code_channel(
     if conflicts:
         die("Claude Code settings 在上次启用后被外部修改，拒绝覆盖：" + ", ".join(conflicts))
     backup = claude_settings_backup(settings)
+    channels_before = CHANNELS_PATH.read_bytes() if CHANNELS_PATH.exists() else None
+    settings_before = CLAUDE_CODE_SETTINGS_PATH.read_bytes() if CLAUDE_CODE_SETTINGS_PATH.exists() else None
     _apply_claude_plan(settings, data, plan)
-    # Persist the journal before replacing settings so recovery never relies on a full snapshot.
-    save_channels(data)
-    claude_settings_write(settings)
-    channel["protocols"] = protocols
-    channel["runtimes"] = runtimes
+    # The journal is durable before settings so a crash can recover, but any
+    # ordinary write failure is compensated back to the exact pre-operation
+    # bytes.  The registry is committed only after settings replacement works.
     anthropic = protocols["anthropic"]
     runtime = runtimes["claude_code"]
-    channel.update({
-        "claude_base_url": anthropic["base_url"],
-        "claude_models": anthropic["models"],
-        "claude_model_map": runtime["model_map"],
-        "claude_default_role": runtime["default_role"],
-        "claude_effort": runtime["effort"],
-        "claude_auth_mode": anthropic["auth"]["mode"],
-        "claude_enabled": True,
-        "claude_last_enabled_at": datetime.now(timezone.utc).isoformat(),
-    })
-    for item in data.get("channels", {}).values():
-        if item is not channel and isinstance(item, dict):
-            item["claude_enabled"] = False
-    data["claude_active"] = slug
-    save_channels(data)
+    try:
+        save_channels(data)
+        claude_settings_write(settings)
+        channel["protocols"] = protocols
+        channel["runtimes"] = runtimes
+        channel.update({
+            "claude_base_url": anthropic["base_url"],
+            "claude_models": anthropic["models"],
+            "claude_model_map": runtime["model_map"],
+            "claude_default_role": runtime["default_role"],
+            "claude_effort": runtime["effort"],
+            "claude_auth_mode": anthropic["auth"]["mode"],
+            "claude_enabled": True,
+            "claude_last_enabled_at": datetime.now(timezone.utc).isoformat(),
+        })
+        for item in data.get("channels", {}).values():
+            if item is not channel and isinstance(item, dict):
+                item["claude_enabled"] = False
+        data["claude_active"] = slug
+        save_channels(data)
+    except Exception:
+        try:
+            if channels_before is None:
+                CHANNELS_PATH.unlink(missing_ok=True)
+            else:
+                CHANNELS_PATH.write_bytes(channels_before)
+                os.chmod(CHANNELS_PATH, 0o600)
+            if settings_before is None:
+                CLAUDE_CODE_SETTINGS_PATH.unlink(missing_ok=True)
+            else:
+                CLAUDE_CODE_SETTINGS_PATH.write_bytes(settings_before)
+                os.chmod(CLAUDE_CODE_SETTINGS_PATH, 0o600)
+        except Exception as rollback_exc:
+            die(f"Claude 配置写入失败且回滚不完整：{rollback_exc}")
+        raise
     print_heading("Claude Code 已启用", f"{channel.get('name', slug)} ({slug})")
     print_field("Anthropic URL", anthropic["base_url"])
     print_field("默认 alias", runtime["default_role"], tone="accent")
@@ -1661,7 +1771,7 @@ def select_claude_code_channel(
     print_note("Claude Code 新会话会读取新配置；运行中的会话请重启。", kind="warn")
 
 
-def deactivate_claude_code_channel(slug: str | None = None, *, quiet: bool = False) -> None:
+def deactivate_claude_code_channel(slug: str | None = None, *, quiet: bool = False) -> bool:
     data = load_channels()
     active = str(data.get("claude_active") or slug or "")
     state = data.get("runtime_state", {})
@@ -1674,15 +1784,27 @@ def deactivate_claude_code_channel(slug: str | None = None, *, quiet: bool = Fal
                 print_note("检测到旧版 Claude 整体快照；来源含义不明确，未自动覆盖当前配置。", kind="warn")
             else:
                 print_note("当前没有 SGate pointer journal，未修改 Claude Code 配置。", kind="warn")
-        return
+        return False
     target_path = _canonical_claude_settings_path(takeover.get("target_path"))
     current_path = _canonical_claude_settings_path(str(CLAUDE_CODE_SETTINGS_PATH))
     if target_path != current_path:
         die(f"Claude journal 属于 {target_path or '(无效路径)'}，当前配置是 {current_path}；已停止恢复，未修改配置。")
     settings = claude_settings_read()
     validate_claude_settings_shape(settings)
+    # Preflight the three-way restore on a copy.  A credential lookup failure
+    # or any managed-path conflict must leave both settings and the journal
+    # untouched so a later retry remains possible.
+    _, conflicts = _restore_claude_takeover(
+        json.loads(json.dumps(settings, ensure_ascii=False)), takeover
+    )
+    if conflicts:
+        if not quiet:
+            print_note("Claude 配置存在冲突或恢复凭证不可用，已保留 journal，未完成停用：" + ", ".join(conflicts), kind="warn")
+        return False
     backup = claude_settings_backup(settings)
     settings, conflicts = _restore_claude_takeover(settings, takeover)
+    if conflicts:
+        return False
     file_existed = bool(takeover.get("file_existed"))
     if not file_existed and not settings:
         try:
@@ -1711,6 +1833,7 @@ def deactivate_claude_code_channel(slug: str | None = None, *, quiet: bool = Fal
         else:
             print_note("已按 pointer journal 精确恢复 Claude Code 配置。", kind="ok")
         print_note("新会话会读取恢复后的配置；运行中的会话请重启。", kind="warn")
+    return True
 
 
 def configure_claude_code_channel(
@@ -1727,19 +1850,32 @@ def configure_claude_code_channel(
         die(f"渠道不存在：{slug}")
     anthropic, runtime = _anthropic_profile_sections(channel)
     if anthropic_base_url is None:
-        current_url = str(anthropic.get("base_url") or "")
-        anthropic_base_url = input(
-            f"Anthropic Base URL（独立于 OpenAI URL） [{current_url}]："
-        ).strip() or current_url
-    models = _normalized_values(channel.get("models"))
+        current_url = claude_channel_base_url(channel)
+        if current_url:
+            anthropic_base_url = current_url
+            print_note(f"Anthropic URL 继承自总控渠道：{current_url}", kind="ok")
+        else:
+            print_note("该总控渠道尚未保存 Anthropic URL；首次配置才需要输入一次。", kind="warn")
+            anthropic_base_url = input("Anthropic Base URL：").strip()
+            if not anthropic_base_url:
+                print_note("已取消，Claude 配置未写入。", kind="warn")
+                return
+    models = claude_provider_models(channel)
     if model_map is None:
         existing_map = runtime.get("model_map") if isinstance(runtime.get("model_map"), dict) else {}
         selected: dict[str, str] = {}
         for role in CLAUDE_ROLES:
             default_model = existing_map.get(role)
+            role_models = list(models)
+            if not role_models:
+                entered = input(f"Claude alias {role} 的网关模型 ID（必填，回车取消）：").strip()
+                if not entered:
+                    print_note("已取消，Claude 配置未写入。", kind="warn")
+                    return
+                role_models = [entered]
             pick = terminal_radio(
                 f"Claude alias -> 网关模型 ID\n当前 alias：{role}",
-                [(name, name + ("  · 当前" if name == default_model else "")) for name in models],
+                [(name, name + ("  · 当前" if name == default_model else "")) for name in role_models],
                 default=default_model,
                 searchable=True,
             )
@@ -1880,9 +2016,7 @@ def claude_code_interactive() -> None:
             return
 
 
-def opencode_write_runtime_key(slug: str) -> None:
-    """Materialize the selected Keychain secret for OpenCode's file interpolation."""
-    key = keychain_get(slug)
+def _write_opencode_runtime_key_value(slug: str, key: str) -> None:
     OPENCODE_CREDENTIALS_DIR.mkdir(parents=True, exist_ok=True)
     os.chmod(OPENCODE_CREDENTIALS_DIR, 0o700)
     credentials_path = opencode_credentials_path(slug)
@@ -1891,6 +2025,11 @@ def opencode_write_runtime_key(slug: str) -> None:
     os.chmod(tmp, 0o600)
     os.replace(tmp, credentials_path)
     os.chmod(credentials_path, 0o600)
+
+
+def opencode_write_runtime_key(slug: str) -> None:
+    """Materialize the selected Keychain secret for OpenCode's file interpolation."""
+    _write_opencode_runtime_key_value(slug, keychain_get(slug))
 
 
 def opencode_provider_block(channel: dict[str, Any]) -> dict[str, Any]:
@@ -2018,9 +2157,16 @@ def select_opencode_channel(
     if not channel:
         die(f"渠道不存在：{slug}。先执行 add。")
     config = opencode_read_config()
+    validate_opencode_config_shape(config)
     model, effort, chosen_models, chosen_efforts = _resolve_opencode_selection(
         channel, model, effort, selected_models, selected_efforts
     )
+    # Build every desired object in memory first.  No registry or credential
+    # side effect is allowed until the target JSON has passed shape checks.
+    original_data = json.loads(json.dumps(data, ensure_ascii=False))
+    original_config = json.loads(json.dumps(config, ensure_ascii=False))
+    channels_existed = CHANNELS_PATH.exists()
+    config_existed = OPENCODE_CONFIG_PATH.exists()
     channel.update({
         "opencode_model": model,
         "opencode_reasoning_effort": effort,
@@ -2033,21 +2179,46 @@ def select_opencode_channel(
         data["opencode_active"] = slug
     data["active"] = data.get("codex_active", data.get("active"))
     _remember_opencode_fallback(data, config)
-    save_channels(data)
-    opencode_write_runtime_key(slug)
 
     config["$schema"] = "https://opencode.ai/config.json"
     provider_id_value = opencode_provider_id(slug)
-    config.setdefault("provider", {})[provider_id_value] = opencode_provider_block(channel)
+    providers = config.setdefault("provider", {})
+    providers[provider_id_value] = opencode_provider_block(channel)
     model_ref = f"{provider_id_value}/{model}"
     if make_default:
         config["model"] = model_ref
-        build_agent = config.setdefault("agent", {}).setdefault("build", {})
-        if isinstance(build_agent, dict):
-            build_agent["model"] = model_ref
-            build_agent["variant"] = effort
+        agents = config.setdefault("agent", {})
+        build_agent = agents.setdefault("build", {})
+        build_agent["model"] = model_ref
+        build_agent["variant"] = effort
+    validate_opencode_config_shape(config)
+    credentials_path = opencode_credentials_path(slug)
+    old_key = credentials_path.read_bytes() if credentials_path.exists() else None
     backup = opencode_backup_config()
-    opencode_write_config(config)
+    try:
+        opencode_write_runtime_key(slug)
+        opencode_write_config(config)
+        save_channels(data)
+    except Exception:
+        # Compensate all writes made by this operation.  The old registry and
+        # config remain authoritative if a later filesystem step fails.
+        try:
+            if old_key is None:
+                credentials_path.unlink(missing_ok=True)
+            else:
+                credentials_path.write_bytes(old_key)
+                os.chmod(credentials_path, 0o600)
+            if config_existed:
+                opencode_write_config(original_config)
+            elif OPENCODE_CONFIG_PATH.exists():
+                OPENCODE_CONFIG_PATH.unlink()
+            if channels_existed:
+                save_channels(original_data)
+            elif CHANNELS_PATH.exists():
+                CHANNELS_PATH.unlink()
+        except Exception as rollback_exc:
+            die(f"OpenCode 写入失败且回滚不完整：{rollback_exc}")
+        raise
     if quiet:
         return
     if backup:
@@ -2066,35 +2237,125 @@ def select_opencode_channel(
 
 
 def sync_opencode_channels(slugs: list[str], default_slug: str | None = None) -> None:
-    """Make opencode.json contain exactly these managed channels."""
+    """Make opencode.json contain exactly these managed channels in one commit."""
     data = load_channels()
     known = data.get("channels", {})
-    wanted = [slug for slug in slugs if slug in known]
+    wanted = list(dict.fromkeys(slug for slug in slugs if slug in known))
+    config = opencode_read_config()
+    validate_opencode_config_shape(config)
+    data_before = json.loads(json.dumps(data, ensure_ascii=False))
+    config_before = json.loads(json.dumps(config, ensure_ascii=False))
+    config_existed = OPENCODE_CONFIG_PATH.exists()
+    credential_before: dict[str, bytes | None] = {}
+    desired_config = json.loads(json.dumps(config, ensure_ascii=False))
+    desired_data = json.loads(json.dumps(data, ensure_ascii=False))
+    providers = desired_config.setdefault("provider", {})
+    if not isinstance(providers, dict):
+        die("OpenCode 配置的 provider 必须是 JSON 对象；已停止，未修改任何配置。")
+    for provider_id_value in list(providers):
+        if isinstance(provider_id_value, str) and provider_id_value.startswith("sgate_"):
+            providers.pop(provider_id_value, None)
+
+    if default_slug not in wanted:
+        default_slug = wanted[0] if wanted else None
+    if wanted:
+        _remember_opencode_fallback(desired_data, config)
+        for slug, channel in desired_data.get("channels", {}).items():
+            if not isinstance(channel, dict):
+                continue
+            channel["opencode_enabled"] = slug in wanted
+        desired_data["opencode_active"] = default_slug
+        for slug in wanted:
+            channel = desired_data["channels"][slug]
+            model, effort, chosen_models, chosen_efforts = _resolve_opencode_selection(
+                channel, None, None, None, None
+            )
+            channel.update({
+                "opencode_model": model,
+                "opencode_reasoning_effort": effort,
+                "opencode_selected_models": chosen_models,
+                "opencode_selected_efforts": chosen_efforts,
+                "opencode_enabled": True,
+                "opencode_last_enabled_at": datetime.now(timezone.utc).isoformat(),
+            })
+            providers[opencode_provider_id(slug)] = opencode_provider_block(channel)
+        selected_channel = desired_data["channels"][default_slug]
+        default_model = str(selected_channel["opencode_model"])
+        default_effort = str(selected_channel["opencode_reasoning_effort"])
+        default_ref = f"{opencode_provider_id(default_slug)}/{default_model}"
+        desired_config["model"] = default_ref
+        build = desired_config.setdefault("agent", {}).setdefault("build", {})
+        if not isinstance(build, dict):
+            die("OpenCode 配置的 agent.build 必须是 JSON 对象；已停止，未修改任何配置。")
+        build["model"] = default_ref
+        build["variant"] = default_effort
+    else:
+        desired_data["opencode_active"] = None
+        desired_data.pop("opencode_fallback", None)
+        for channel in desired_data.get("channels", {}).values():
+            if isinstance(channel, dict):
+                channel["opencode_enabled"] = False
+        fallback = data.get("opencode_fallback") if isinstance(data.get("opencode_fallback"), dict) else {}
+        for key in ("model", "small_model"):
+            if fallback.get(key):
+                desired_config[key] = fallback[key]
+            else:
+                desired_config.pop(key, None)
+        build = desired_config.get("agent", {}).get("build", {}) if isinstance(desired_config.get("agent"), dict) else {}
+        if isinstance(build, dict):
+            for key, fallback_key in (("model", "build_model"), ("variant", "build_variant")):
+                if fallback.get(fallback_key):
+                    build[key] = fallback[fallback_key]
+                else:
+                    build.pop(key, None)
+    validate_opencode_config_shape(desired_config)
+    all_managed = {
+        slug for slug in known
+        if opencode_provider_id(slug) in (config.get("provider") or {})
+    }
+    for slug in all_managed | set(wanted):
+        path = opencode_credentials_path(slug)
+        credential_before[slug] = path.read_bytes() if path.exists() else None
+    backup = opencode_backup_config()
+    try:
+        for slug in wanted:
+            opencode_write_runtime_key(slug)
+        for slug in all_managed - set(wanted):
+            opencode_credentials_path(slug).unlink(missing_ok=True)
+        opencode_write_config(desired_config)
+        save_channels(desired_data)
+    except Exception:
+        try:
+            for slug, old in credential_before.items():
+                path = opencode_credentials_path(slug)
+                if old is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    path.write_bytes(old)
+                    os.chmod(path, 0o600)
+            if config_existed:
+                opencode_write_config(config_before)
+            elif OPENCODE_CONFIG_PATH.exists():
+                OPENCODE_CONFIG_PATH.unlink()
+            if CHANNELS_PATH.exists():
+                save_channels(data_before)
+        except Exception as rollback_exc:
+            die(f"OpenCode 同步失败且回滚不完整：{rollback_exc}")
+        raise
+
     if not wanted:
-        for slug in opencode_enabled_slugs():
-            deactivate_opencode_channel(slug, quiet=True)
         print_note("已停用所有 OpenCode 渠道。", kind="ok")
         return
-    if default_slug not in wanted:
-        default_slug = wanted[0]
-
-    for slug in opencode_enabled_slugs():
-        if slug not in wanted:
-            deactivate_opencode_channel(slug, quiet=True)
-    for slug in wanted:
-        select_opencode_channel(slug, make_default=(slug == default_slug), quiet=True)
-
     print_heading("OpenCode 渠道已同步", f"共 {len(wanted)} 个渠道")
     rows = []
     for slug in wanted:
-        channel = known[slug]
+        channel = desired_data["channels"][slug]
         is_default = slug == default_slug
         rows.append([
             green(ICON_ON) if is_default else dim(ICON_ON),
-            channel.get("name", slug),
-            slug,
-            str(_channel_value(channel, "opencode", "model") or "(未选)"),
-            str(_channel_value(channel, "opencode", "reasoning_effort") or DEFAULT_EFFORT),
+            channel.get("name", slug), slug,
+            str(channel.get("opencode_model") or "(未选)"),
+            str(channel.get("opencode_reasoning_effort") or DEFAULT_EFFORT),
             green("默认") if is_default else dim("可切换"),
         ])
     print_table(["", "名称", "slug", "模型", "强度", "状态"], rows)
@@ -2103,44 +2364,49 @@ def sync_opencode_channels(slugs: list[str], default_slug: str | None = None) ->
     print_note("OpenCode 需要重启后读取新配置。", kind="warn")
 
 
-def remove_opencode_provider(slug: str, *, restore: bool = False) -> None:
-    config = opencode_read_config()
+def _remove_opencode_provider_from_config(
+    config: dict[str, Any], slug: str, *, restore: bool = False,
+    data: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Pure in-memory removal of one SGate provider."""
     provider_id_value = opencode_provider_id(slug)
     providers = config.get("provider")
-    if isinstance(providers, dict):
-        providers.pop(provider_id_value, None)
+    if not isinstance(providers, dict):
+        raise ValueError("OpenCode provider must be an object")
+    providers.pop(provider_id_value, None)
     current_provider = str(config.get("model", "")).partition("/")[0]
     deleted_prefix = provider_id_value + "/"
-    if str(config.get("model", "")).startswith(deleted_prefix):
-        config.pop("model", None)
-    if str(config.get("small_model", "")).startswith(deleted_prefix):
-        config.pop("small_model", None)
+    for key in ("model", "small_model"):
+        if str(config.get(key, "")).startswith(deleted_prefix):
+            config.pop(key, None)
     agents = config.get("agent")
     if isinstance(agents, dict):
         for agent in agents.values():
             if isinstance(agent, dict) and str(agent.get("model", "")).startswith(deleted_prefix):
                 agent.pop("model", None)
     if restore and current_provider == provider_id_value:
-        data = load_channels()
-        fallback = data.get("opencode_fallback") if isinstance(data.get("opencode_fallback"), dict) else {}
-        if fallback.get("model"):
-            config["model"] = fallback["model"]
-        else:
-            config.pop("model", None)
-        if fallback.get("small_model"):
-            config["small_model"] = fallback["small_model"]
-        else:
-            config.pop("small_model", None)
+        source = data if isinstance(data, dict) else load_channels()
+        fallback = source.get("opencode_fallback") if isinstance(source.get("opencode_fallback"), dict) else {}
+        for key in ("model", "small_model"):
+            if fallback.get(key):
+                config[key] = fallback[key]
+            else:
+                config.pop(key, None)
         build = config.get("agent", {}).get("build", {}) if isinstance(config.get("agent"), dict) else {}
         if isinstance(build, dict):
-            if fallback.get("build_model"):
-                build["model"] = fallback["build_model"]
-            else:
-                build.pop("model", None)
-            if fallback.get("build_variant"):
-                build["variant"] = fallback["build_variant"]
-            else:
-                build.pop("variant", None)
+            for key, fallback_key in (("model", "build_model"), ("variant", "build_variant")):
+                if fallback.get(fallback_key):
+                    build[key] = fallback[fallback_key]
+                else:
+                    build.pop(key, None)
+    validate_opencode_config_shape(config)
+    return config
+
+
+def remove_opencode_provider(slug: str, *, restore: bool = False) -> None:
+    config = opencode_read_config()
+    validate_opencode_config_shape(config)
+    config = _remove_opencode_provider_from_config(config, slug, restore=restore)
     if OPENCODE_CONFIG_PATH.exists():
         backup = opencode_backup_config()
         opencode_write_config(config)
@@ -2149,25 +2415,75 @@ def remove_opencode_provider(slug: str, *, restore: bool = False) -> None:
 
 
 def deactivate_opencode_channel(slug: str, *, quiet: bool = False) -> None:
-    """Remove one provider, promoting another managed channel if it was default."""
-    remaining = [s for s in opencode_enabled_slugs() if s != slug]
-    remove_opencode_provider(slug, restore=not remaining)
+    """Remove one provider with a single config/registry commit and rollback."""
     data = load_channels()
-    channel = data.get("channels", {}).get(slug)
-    if channel:
+    config = opencode_read_config()
+    validate_opencode_config_shape(config)
+    provider_ids = config.get("provider", {})
+    enabled = [
+        s for s in data.get("channels", {})
+        if isinstance(provider_ids, dict) and opencode_provider_id(s) in provider_ids
+    ]
+    remaining = [s for s in enabled if s != slug]
+    promoted = remaining[0] if data.get("opencode_active") == slug and remaining else None
+    desired_config = json.loads(json.dumps(config, ensure_ascii=False))
+    desired_data = json.loads(json.dumps(data, ensure_ascii=False))
+    _remove_opencode_provider_from_config(
+        desired_config, slug, restore=not remaining, data=data
+    )
+    if promoted:
+        channel = desired_data.get("channels", {}).get(promoted, {})
+        model = str(_channel_value(channel, "opencode", "model") or DEFAULT_MODEL)
+        effort = str(_channel_value(channel, "opencode", "reasoning_effort") or DEFAULT_EFFORT)
+        default_ref = f"{opencode_provider_id(promoted)}/{model}"
+        desired_config["model"] = default_ref
+        build = desired_config.setdefault("agent", {}).setdefault("build", {})
+        if isinstance(build, dict):
+            build["model"] = default_ref
+            build["variant"] = effort
+    channel = desired_data.get("channels", {}).get(slug)
+    if isinstance(channel, dict):
         channel["opencode_enabled"] = False
         channel["opencode_last_disabled_at"] = datetime.now(timezone.utc).isoformat()
-    promoted: str | None = None
-    if data.get("opencode_active") == slug:
-        data["opencode_active"] = remaining[0] if remaining else None
-        promoted = remaining[0] if remaining else None
+    if desired_data.get("opencode_active") == slug:
+        desired_data["opencode_active"] = promoted
     if not remaining:
-        data.pop("opencode_fallback", None)
-    save_channels(data)
-    if promoted:
-        select_opencode_channel(promoted, make_default=True, quiet=True)
+        desired_data.pop("opencode_fallback", None)
+    validate_opencode_config_shape(desired_config)
+    config_before = OPENCODE_CONFIG_PATH.read_bytes() if OPENCODE_CONFIG_PATH.exists() else None
+    channels_before = CHANNELS_PATH.read_bytes() if CHANNELS_PATH.exists() else None
+    credentials = opencode_credentials_path(slug)
+    credential_before = credentials.read_bytes() if credentials.exists() else None
+    backup = opencode_backup_config()
+    try:
+        if OPENCODE_CONFIG_PATH.exists():
+            opencode_write_config(desired_config)
+        credentials.unlink(missing_ok=True)
+        save_channels(desired_data)
+    except Exception:
+        try:
+            if config_before is None:
+                OPENCODE_CONFIG_PATH.unlink(missing_ok=True)
+            else:
+                OPENCODE_CONFIG_PATH.write_bytes(config_before)
+                os.chmod(OPENCODE_CONFIG_PATH, 0o600)
+            if credential_before is None:
+                credentials.unlink(missing_ok=True)
+            else:
+                credentials.write_bytes(credential_before)
+                os.chmod(credentials, 0o600)
+            if channels_before is None:
+                CHANNELS_PATH.unlink(missing_ok=True)
+            else:
+                CHANNELS_PATH.write_bytes(channels_before)
+                os.chmod(CHANNELS_PATH, 0o600)
+        except Exception as rollback_exc:
+            die(f"OpenCode 停用失败且回滚不完整：{rollback_exc}")
+        raise
     if quiet:
         return
+    if backup:
+        print_note(f"已备份 OpenCode 配置：{dim(str(backup))}")
     print_note(f"已从 OpenCode 配置移除渠道 {slug}。", kind="ok")
     if promoted:
         print_note(f"默认渠道已改为 {promoted}。")
@@ -2346,7 +2662,12 @@ def opencode_interactive() -> None:
 def engine_interactive() -> None:
     while True:
         try:
-            data = load_channels()
+            try:
+                data = load_channels()
+                registry_error = ""
+            except SystemExit as exc:
+                data = {"channels": {}}
+                registry_error = str(exc)
             total = len(data.get("channels", {}))
             try:
                 codex_info = current_config_info()
@@ -2372,7 +2693,8 @@ def engine_interactive() -> None:
                 f"渠道：{total} 个\n"
                 f"Codex：{codex_name} · {codex_info['model']}\n"
                 f"OpenCode：{len(oc_enabled)} 个已启用\n"
-                f"Claude Code：{claude_name} · {claude_info['model']}",
+                f"Claude Code：{claude_name} · {claude_info['model']}"
+                + (f"\n注册表：{registry_error}" if registry_error else ""),
                 [
                     ("channels", "[渠道管理] 新增、删除、总览和连接检查"),
                     ("codex", "[Codex] 选择渠道、模型、思考强度并启用"),
@@ -3281,24 +3603,25 @@ def remove_channel(slug: str) -> None:
     if codex_current:
         deactivate_channel()
         data = load_channels()
-    if opencode_config_is_valid():
-        if opencode_current:
-            deactivate_opencode_channel(slug)
-            data = load_channels()
-        else:
-            remove_opencode_provider(slug)
-    elif opencode_current:
-        print("警告：OpenCode 配置损坏，已跳过配置清理；请修复后手动删除该渠道的 OpenCode provider。")
-    if data.get("claude_active") == slug:
-        deactivate_claude_code_channel(slug, quiet=True)
+    if not opencode_config_is_valid():
+        die("OpenCode 配置损坏，无法安全确认 provider 已清理；请修复配置后再删除渠道。")
+    if opencode_current:
+        deactivate_opencode_channel(slug)
         data = load_channels()
+    else:
+        remove_opencode_provider(slug)
+    if data.get("claude_active") == slug:
+        if not deactivate_claude_code_channel(slug, quiet=True):
+            die("Claude Code 未能验证恢复完成；已停止删除渠道、运行时密钥和 Keychain。")
+        data = load_channels()
+    if not keychain_delete(slug):
+        die("无法确认 Keychain 密钥已删除；已停止删除渠道记录，请修复 Keychain 后重试。")
     try:
         opencode_credentials_path(slug).unlink()
     except FileNotFoundError:
         pass
     data["channels"].pop(slug, None)
     save_channels(data)
-    keychain_delete(slug)
     print_note(f"已删除渠道 {slug} 及其 Keychain 密钥。", kind="ok")
 
 

@@ -431,9 +431,12 @@ class SGateTests(unittest.TestCase):
         sgate.CLAUDE_CODE_SETTINGS_PATH.write_text(json.dumps(local), encoding="utf-8")
         sgate.deactivate_claude_code_channel("test")
         restored = json.loads(sgate.CLAUDE_CODE_SETTINGS_PATH.read_text(encoding="utf-8"))
-        self.assertEqual(restored["model"], "user-choice")
-        self.assertEqual(restored["permissions"], local["permissions"])
-        self.assertEqual(restored["env"], {"KEEP": "yes"})
+        # A managed-path conflict is fail-closed: the local file and journal
+        # remain untouched so the user can retry after deciding what to keep.
+        self.assertEqual(restored, local)
+        state = json.loads(sgate.CHANNELS_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(state["claude_active"], "test")
+        self.assertIn("takeover", state["runtime_state"]["claude_code"])
 
     def test_claude_switch_keeps_first_before_value(self) -> None:
         sgate.CLAUDE_CODE_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -543,6 +546,21 @@ class SGateTests(unittest.TestCase):
         restored = json.loads(sgate.CLAUDE_CODE_SETTINGS_PATH.read_text(encoding="utf-8"))
         self.assertIn("model", restored)
         self.assertIsNone(restored["model"])
+
+    def test_claude_journal_explicit_exists_avoids_marker_collision(self) -> None:
+        settings = {"model": {"__sgate_journal_missing__": True}}
+        sgate.CLAUDE_CODE_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        sgate.CLAUDE_CODE_SETTINGS_PATH.write_text(json.dumps(settings), encoding="utf-8")
+        sgate.select_claude_code_channel(
+            "test", anthropic_base_url="https://a.example", default_role="sonnet", effort="high",
+            model_map={"opus": "o", "sonnet": "s", "haiku": "h"},
+        )
+        data = json.loads(sgate.CHANNELS_PATH.read_text(encoding="utf-8"))
+        entry = next(item for item in data["runtime_state"]["claude_code"]["takeover"]["entries"] if item["path"] == "/model")
+        self.assertTrue(entry["before_exists"])
+        sgate.deactivate_claude_code_channel("test")
+        restored = json.loads(sgate.CLAUDE_CODE_SETTINGS_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(restored, settings)
 
     def test_claude_desktop_use_never_rewrites_desktop_json(self) -> None:
         original = {"mcpServers": {"demo": {"command": "demo"}}, "other": True}

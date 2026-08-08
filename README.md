@@ -35,7 +35,7 @@ sgate --help
 
 ## 主要功能
 
-- API Key 只写入 macOS Keychain，不写入 `config.toml` 或命令行参数。
+- API Key 不写入 `config.toml` 或 SGate 配置文件，密钥源为 macOS Keychain；macOS `security add-generic-password -w` 的系统调用会短暂携带密钥参数，SGate 不记录或打印该值。
 - 自动请求渠道的 `/models` 接口并缓存模型列表。
 - 模型支持多选：在项目上按 `Space` 勾选，再按一次取消。
 - Codex/OpenCode 推理强度继续支持多选：`minimal`、`low`、`medium`、`high`、`xhigh`。
@@ -50,7 +50,7 @@ sgate --help
 - OpenCode 支持多渠道同时启用：所有勾选渠道都会写入 `provider`，其中一个作为默认，可在 OpenCode 内用 `/models` 直接切换。
 - OpenCode 使用合法的 `provider`、`model` 和 `agent.build.variant` 配置，保留 `minimal`、`low`、`medium`、`high`、`xhigh` 思考强度。
 - 状态、总览、连接检查均为带颜色的分栏表格输出；管道输出、`NO_COLOR` 或非 TTY 环境自动降级为纯文本。
-- OpenCode API Key 仍以 macOS Keychain 为密钥源；运行 OpenCode 时写入每渠道独立、权限为 `0600` 的临时引用文件，并通过 `{file:...}` 引用，不写入 `opencode.json`。
+- OpenCode API Key 仍以 macOS Keychain 为密钥源；启用 OpenCode 时写入每渠道独立、权限为 `0600` 的运行时引用文件，并通过 `{file:...}` 引用，不写入 `opencode.json`；停用或删除渠道时清理该文件。
 - Claude Code 使用独立的 Anthropic 配置（`protocols.anthropic`），通过 macOS Keychain 和 `apiKeyHelper` 动态读取密钥；不会从 OpenAI Base URL 猜 Anthropic endpoint，也不会写 `ANTHROPIC_MODEL`。
 - Claude Desktop JSON 只读：SGate 仅读取 MCP 信息，Code tab 复用 Claude Code settings；Desktop Chat/Cowork 的账户与 bearer-only 认证由官方应用管理，SGate 不写不受支持的 provider 字段。
 
@@ -173,7 +173,7 @@ sgate remove <slug>
 - SGate 模型目录：`~/.codex/sgate-model-catalog.json`
 - 配置备份：`~/.codex/config.toml.sgate-*.bak`
 - OpenCode 配置：`~/.config/opencode/opencode.json`（可由 `OPENCODE_CONFIG` 覆盖）
-- OpenCode 运行时密钥：`~/.config/opencode/.sgate/<channel>-api-key`
+- OpenCode 运行时密钥：`~/.config/opencode/.sgate/<channel>-api-key`（启用时生成、停用/删除时清理，权限 `0600`）
 - Claude Code 配置：`~/.claude/settings.json`（可由 `CLAUDE_CODE_SETTINGS` 覆盖）
 - Claude Code 配置备份：`~/.claude/sgate-backups/settings.json.sgate-*.bak`
 - Claude Desktop 配置：`~/Library/Application Support/Claude/claude_desktop_config.json`（可由 `CLAUDE_DESKTOP_CONFIG` 覆盖）
