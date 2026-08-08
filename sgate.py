@@ -1208,6 +1208,28 @@ class ClaudeManagedPlan:
         )
 
 
+def _claude_profile_shape_diagnostics(profile: Any) -> list[str]:
+    """Validate nested Claude containers before compatibility fallbacks run."""
+    if not isinstance(profile, dict):
+        return ["profile must be an object"]
+    diagnostics: list[str] = []
+    protocols = profile.get("protocols")
+    if protocols is not None and not isinstance(protocols, dict):
+        diagnostics.append("protocols must be an object")
+    elif isinstance(protocols, dict):
+        anthropic = protocols.get("anthropic")
+        if anthropic is not None and not isinstance(anthropic, dict):
+            diagnostics.append("protocols.anthropic must be an object")
+    runtimes = profile.get("runtimes")
+    if runtimes is not None and not isinstance(runtimes, dict):
+        diagnostics.append("runtimes must be an object")
+    elif isinstance(runtimes, dict):
+        claude_code = runtimes.get("claude_code")
+        if claude_code is not None and not isinstance(claude_code, dict):
+            diagnostics.append("runtimes.claude_code must be an object")
+    return diagnostics
+
+
 def _anthropic_profile_sections(profile: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
     protocols = profile.get("protocols")
     protocols = protocols if isinstance(protocols, dict) else {}
@@ -1215,8 +1237,11 @@ def _anthropic_profile_sections(profile: dict[str, Any]) -> tuple[dict[str, Any]
     anthropic = dict(anthropic) if isinstance(anthropic, dict) else {}
     if not anthropic:
         flat_map = profile.get("claude_model_map")
+        # Legacy fields may provide hints/catalogs, but a shared OpenAI
+        # ``base_url`` is deliberately not copied: Messages and Responses
+        # are different contracts and guessing is unsafe.
         anthropic = {
-            "base_url": profile.get("anthropic_base_url") or profile.get("claude_base_url"),
+            "base_url": profile.get("anthropic_base_url"),
             "models": (
                 profile.get("anthropic_models") if isinstance(profile.get("anthropic_models"), list)
                 else profile.get("claude_models") if isinstance(profile.get("claude_models"), list)
@@ -1253,8 +1278,8 @@ def compile_claude_managed_values(
     """Compile the exact Claude Code settings managed by SGate, failing closed."""
     if not isinstance(profile, dict):
         return ClaudeManagedPlan({}, (), ("profile must be an object",), False)
+    diagnostics: list[str] = _claude_profile_shape_diagnostics(profile)
     anthropic, runtime = _anthropic_profile_sections(profile)
-    diagnostics: list[str] = []
     # ``runtimes.claude_code.effort`` is the sole canonical source.  Legacy
     # flat fields remain readable for old channel records only when they agree;
     # contradictory values are rejected rather than silently selecting one.
@@ -1275,33 +1300,68 @@ def compile_claude_managed_values(
                 diagnostics.append(f"Claude effort conflict: runtimes.claude_code.effort != {key}")
     elif isinstance(runtime_record, dict) and runtime_record and flat_efforts:
         diagnostics.append("flat Claude effort cannot override a runtime record without effort")
-    base_url = str(anthropic.get("base_url") or "").strip().rstrip("/")
-    if not re.match(r"^https?://", base_url, re.I):
-        diagnostics.append("Anthropic Base URL is required and must start with http:// or https://")
+    raw_base_url = anthropic.get("base_url")
+    if not isinstance(raw_base_url, str) or not raw_base_url.strip():
+        diagnostics.append("Anthropic Base URL is required in protocols.anthropic.base_url; shared OpenAI base_url is not inferred")
+        base_url = ""
+    else:
+        base_url = raw_base_url.strip().rstrip("/")
+        if not re.match(r"^https?://", base_url, re.I):
+            diagnostics.append("Anthropic Base URL must start with http:// or https://")
+        if re.search(r"/v1$", base_url, re.I):
+            diagnostics.append("Anthropic Base URL must be the gateway root, not a URL ending in /v1")
     model_map = runtime.get("model_map")
-    if not isinstance(model_map, dict):
+    if model_map is not None and not isinstance(model_map, dict):
+        diagnostics.append("model_map must be an object")
         model_map = {}
-    normalized_map = {role: str(model_map.get(role) or "").strip() for role in CLAUDE_ROLES}
+    if model_map is None:
+        model_map = {}
+    normalized_map: dict[str, str] = {}
+    for role in CLAUDE_ROLES:
+        value = model_map.get(role)
+        if isinstance(value, str):
+            normalized_map[role] = value.strip()
+        else:
+            normalized_map[role] = ""
+            if value is not None:
+                diagnostics.append(f"Claude alias {role} must be a string")
     missing = [role for role, model in normalized_map.items() if not model]
     extra = [str(role) for role in model_map if role not in CLAUDE_ROLES]
     if missing:
         diagnostics.append(f"explicit model mapping required for: {', '.join(missing)}")
     if extra:
         diagnostics.append(f"unsupported Claude aliases: {', '.join(extra)}")
-    default_role = str(runtime.get("default_role") or "").strip().casefold()
+    raw_default_role = runtime.get("default_role")
+    default_role = raw_default_role.strip().casefold() if isinstance(raw_default_role, str) else ""
+    if raw_default_role is not None and not isinstance(raw_default_role, str):
+        diagnostics.append("default_role must be a string")
     if default_role not in CLAUDE_ROLES:
         diagnostics.append("default_role must be one of: opus, sonnet, haiku")
-    effort = str(runtime.get("effort") or "").strip().casefold()
+    raw_effort = runtime.get("effort")
+    effort = raw_effort.strip().casefold() if isinstance(raw_effort, str) else ""
+    if raw_effort is not None and not isinstance(raw_effort, str):
+        diagnostics.append("effort must be a string")
     if effort not in CLAUDE_EFFORTS:
         diagnostics.append("effort must be one of: low, medium, high")
-    auth = anthropic.get("auth")
-    auth = auth if isinstance(auth, dict) else {}
-    auth_mode = str(auth.get("mode") or "api_key_helper").strip()
+    raw_auth = anthropic.get("auth", _MISSING)
+    if raw_auth is not _MISSING and not isinstance(raw_auth, dict):
+        diagnostics.append("protocols.anthropic.auth must be an object")
+    auth = raw_auth if isinstance(raw_auth, dict) else {}
+    if "backend" in auth and auth.get("backend") != "keychain":
+        diagnostics.append("Claude auth backend must be keychain")
+    raw_auth_mode = auth.get("mode", "api_key_helper")
+    auth_mode = raw_auth_mode.strip() if isinstance(raw_auth_mode, str) else ""
+    if raw_auth_mode is not None and not isinstance(raw_auth_mode, str):
+        diagnostics.append("Claude auth mode must be a string")
     if auth_mode != "api_key_helper":
         diagnostics.append(
             f"auth mode {auth_mode!r} is unsupported for persistent Claude settings; use api_key_helper"
         )
-    secret_ref = str(auth.get("secret_ref") or profile.get("slug") or "").strip()
+    has_secret_ref = isinstance(raw_auth, dict) and "secret_ref" in raw_auth
+    raw_secret_ref = auth.get("secret_ref") if has_secret_ref else profile.get("slug")
+    secret_ref = raw_secret_ref.strip() if isinstance(raw_secret_ref, str) else ""
+    if raw_secret_ref is not None and not isinstance(raw_secret_ref, str):
+        diagnostics.append("auth.secret_ref must be a non-empty Keychain slug string")
     if not secret_ref:
         diagnostics.append("auth.secret_ref or profile.slug is required")
     if diagnostics:
@@ -1336,24 +1396,15 @@ def compile_claude_managed_values(
 
 
 def claude_channel_base_url(channel: dict[str, Any]) -> str:
-    """Resolve the Anthropic URL already owned by the selected control channel.
+    """Return only an explicitly saved Anthropic gateway root.
 
-    Claude Code's ``ANTHROPIC_BASE_URL`` is the gateway root; Claude itself
-    appends ``/v1/messages``. A channel created by older SGate versions only
-    has the shared OpenAI URL, so inherit that root by removing a terminal
-    OpenAI ``/v1`` suffix instead of prompting again during tool selection.
+    The shared channel ``base_url`` belongs to OpenAI Responses and must never
+    be guessed as an Anthropic Messages endpoint.
     """
-    anthropic, _ = _anthropic_profile_sections(channel)
-    explicit = anthropic.get("base_url")
-    if isinstance(explicit, str) and explicit.strip():
-        return explicit.strip().rstrip("/")
-    shared = channel.get("base_url")
-    if isinstance(shared, str) and shared.strip():
-        value = shared.strip().rstrip("/")
-        if value.casefold().endswith("/v1"):
-            value = value[:-3].rstrip("/")
-        return value
-    return ""
+    protocols = channel.get("protocols") if isinstance(channel, dict) else None
+    anthropic = protocols.get("anthropic") if isinstance(protocols, dict) else None
+    explicit = anthropic.get("base_url") if isinstance(anthropic, dict) else None
+    return explicit.strip().rstrip("/") if isinstance(explicit, str) and explicit.strip() else ""
 
 
 def _claude_profile(
@@ -1362,20 +1413,18 @@ def _claude_profile(
     effort: str | None = None, auth_mode: str | None = None,
 ) -> dict[str, Any]:
     profile = json.loads(json.dumps(channel, ensure_ascii=False))
+    shape_errors = _claude_profile_shape_diagnostics(profile)
+    if shape_errors:
+        die("Claude 渠道配置结构损坏：" + "；".join(shape_errors) + "；已停止，未修改配置。")
     anthropic, runtime = _anthropic_profile_sections(profile)
-    # The control-channel profile is the source of truth. A caller may supply
-    # an explicit URL for non-interactive migration, but the interactive path
-    # never asks again once the channel has a saved URL (or shared base URL).
-    if anthropic_base_url is not None and str(anthropic_base_url).strip():
-        anthropic["base_url"] = str(anthropic_base_url).strip()
-    elif not str(anthropic.get("base_url") or "").strip():
-        inherited = claude_channel_base_url(channel)
-        if inherited:
-            anthropic["base_url"] = inherited
+    # Only an explicit Anthropic URL may populate this profile. A shared
+    # OpenAI base URL is intentionally never inherited.
+    if anthropic_base_url is not None:
+        anthropic["base_url"] = anthropic_base_url
     if model_map is not None:
         # The Anthropic catalog is a list; the runtime role mapping is the
         # separate authoritative dictionary.
-        anthropic["models"] = list(dict.fromkeys(str(value) for value in model_map.values()))
+        anthropic["models"] = list(dict.fromkeys(model_map.values()))
         runtime["model_map"] = dict(model_map)
     if default_role is not None:
         runtime["default_role"] = default_role
@@ -1393,7 +1442,8 @@ def _claude_profile(
         profile["claude_reasoning_effort"] = runtime.get("effort")
     auth = anthropic.get("auth")
     auth = dict(auth) if isinstance(auth, dict) else {}
-    auth["mode"] = auth_mode or auth.get("mode") or "api_key_helper"
+    auth["mode"] = auth_mode if auth_mode is not None else auth.get("mode") or "api_key_helper"
+    auth.setdefault("backend", "keychain")
     auth["secret_ref"] = channel.get("slug")
     anthropic["auth"] = auth
     protocols = profile.setdefault("protocols", {})

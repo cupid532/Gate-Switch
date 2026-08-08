@@ -343,6 +343,32 @@ class SGateTests(unittest.TestCase):
         profile["runtimes"]["claude_code"]["model_map"].pop("haiku")
         self.assertFalse(sgate.compile_claude_managed_values(profile).supported)
 
+    def test_claude_shared_openai_url_is_not_inferred(self) -> None:
+        channel = json.loads(sgate.CHANNELS_PATH.read_text(encoding="utf-8"))["channels"]["test"]
+        self.assertEqual(sgate.claude_channel_base_url(channel), "")
+        profile = sgate._claude_profile(channel, model_map={"opus": "o", "sonnet": "s", "haiku": "h"}, default_role="sonnet", effort="high")
+        plan = sgate.compile_claude_managed_values(profile)
+        self.assertFalse(plan.supported)
+        self.assertTrue(any("shared OpenAI base_url" in item for item in plan.diagnostics))
+
+    def test_claude_endpoint_root_and_secret_ref_are_strict(self) -> None:
+        base = {
+            "slug": "test",
+            "protocols": {"anthropic": {"base_url": "https://anthropic.example/v1", "auth": {"secret_ref": {"slug": "bad"}}}},
+            "runtimes": {"claude_code": {"default_role": "sonnet", "effort": "high", "model_map": {"opus": "o", "sonnet": "s", "haiku": "h"}}},
+        }
+        plan = sgate.compile_claude_managed_values(base)
+        self.assertFalse(plan.supported)
+        self.assertTrue(any("ending in /v1" in item for item in plan.diagnostics))
+        self.assertTrue(any("secret_ref" in item for item in plan.diagnostics))
+        self.assertNotIn("apiKeyHelper", plan.desired)
+
+    def test_claude_profile_malformed_containers_fail_closed(self) -> None:
+        for profile in ({"protocols": []}, {"protocols": {"anthropic": []}}, {"runtimes": []}, {"runtimes": {"claude_code": []}}):
+            plan = sgate.compile_claude_managed_values(profile)
+            self.assertFalse(plan.supported)
+            self.assertTrue(plan.diagnostics)
+
     def test_claude_code_writes_independent_anthropic_role_map(self) -> None:
         original = {
             "permissions": {"allow": ["Bash(pwd)"]},

@@ -51,7 +51,7 @@ sgate --help
 - OpenCode 使用合法的 `provider`、`model` 和 `agent.build.variant` 配置，保留 `minimal`、`low`、`medium`、`high`、`xhigh` 思考强度。
 - 状态、总览、连接检查均为带颜色的分栏表格输出；管道输出、`NO_COLOR` 或非 TTY 环境自动降级为纯文本。
 - OpenCode API Key 仍以 macOS Keychain 为密钥源；启用 OpenCode 时写入每渠道独立、权限为 `0600` 的运行时引用文件，并通过 `{file:...}` 引用，不写入 `opencode.json`；停用或删除渠道时清理该文件。
-- Claude Code 使用独立的 Anthropic 配置（`protocols.anthropic`），通过 macOS Keychain 和 `apiKeyHelper` 动态读取密钥；不会从 OpenAI Base URL 猜 Anthropic endpoint，也不会写 `ANTHROPIC_MODEL`。
+- Claude Code 使用独立的 Anthropic 配置（`protocols.anthropic`），通过 macOS Keychain 和 `apiKeyHelper` 动态读取密钥；不会从 OpenAI Base URL 猜 Anthropic endpoint，也不会写 `ANTHROPIC_MODEL`。Anthropic Base URL 必须显式配置为 gateway root（例如 `https://gateway.example`，不能以 `/v1` 结尾），`auth.secret_ref` 必须是 Keychain slug 字符串。
 - Claude Desktop JSON 只读：SGate 仅读取 MCP 信息，Code tab 复用 Claude Code settings；Desktop Chat/Cowork 的账户与 bearer-only 认证由官方应用管理，SGate 不写不受支持的 provider 字段。
 
 ## 交互按键
