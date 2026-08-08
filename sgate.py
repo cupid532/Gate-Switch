@@ -70,6 +70,27 @@ CLAUDE_MANAGED_ENV = (
     "ANTHROPIC_DEFAULT_HAIKU_MODEL",
 )
 CLAUDE_TAKEOVER_KEY = "claude_code"
+# Journal paths are deliberately closed over the settings SGate knows how to
+# take over.  A journal is persisted in channels.json, so accepting arbitrary
+# JSON pointers here would let a stale/tampered channels file rewrite unrelated
+# Claude settings during ``disable``.
+_CLAUDE_JOURNAL_PATHS = frozenset({
+    "/model",
+    "/effortLevel",
+    "/apiKeyHelper",
+    "/env/ANTHROPIC_BASE_URL",
+    "/env/ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "/env/ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "/env/ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    # Legacy SGate-managed values are accepted only for restoration of a
+    # takeover created by an older script version; they are never emitted by
+    # the current planner.
+    "/env/ANTHROPIC_API_KEY",
+    "/env/ANTHROPIC_AUTH_TOKEN",
+    "/env/ANTHROPIC_MODEL",
+    "/env/ANTHROPIC_DEFAULT_FABLE_MODEL",
+    "/env/CLAUDE_CODE_EFFORT_LEVEL",
+})
 # An identity-only sentinel cannot collide with a legitimate JSON value. New
 # journal entries also persist an explicit ``exists`` bit for portability.
 _MISSING = object()
@@ -730,6 +751,9 @@ def load_channels() -> dict[str, Any]:
     # Keep migration in memory until the next intentional mutation so opening or
     # cancelling an interactive picker never writes channels.json by itself.
     migrate_legacy_claude_profiles(data)
+    # ``channels.json`` is user-editable state; validate any persisted Claude
+    # takeover before callers can perform status/disable or another mutation.
+    _validate_claude_takeover(data)
     return data
 
 
@@ -1190,6 +1214,26 @@ def compile_claude_managed_values(
         return ClaudeManagedPlan({}, (), ("profile must be an object",), False)
     anthropic, runtime = _anthropic_profile_sections(profile)
     diagnostics: list[str] = []
+    # ``runtimes.claude_code.effort`` is the sole canonical source.  Legacy
+    # flat fields remain readable for old channel records only when they agree;
+    # contradictory values are rejected rather than silently selecting one.
+    flat_efforts = []
+    for key in ("effort", "claude_effort", "claude_reasoning_effort"):
+        value = profile.get(key)
+        if value is not None and str(value).strip():
+            flat_efforts.append((key, str(value).strip().casefold()))
+    runtime_container = profile.get("runtimes")
+    runtime_record = runtime_container.get("claude_code") if isinstance(runtime_container, dict) else None
+    runtime_has_effort = isinstance(runtime_record, dict) and "effort" in runtime_record
+    canonical_runtime_effort = str(runtime.get("effort") or "").strip().casefold()
+    if len({value for _, value in flat_efforts}) > 1:
+        diagnostics.append("conflicting legacy Claude effort fields")
+    if runtime_has_effort:
+        for key, value in flat_efforts:
+            if value != canonical_runtime_effort:
+                diagnostics.append(f"Claude effort conflict: runtimes.claude_code.effort != {key}")
+    elif isinstance(runtime_record, dict) and runtime_record and flat_efforts:
+        diagnostics.append("flat Claude effort cannot override a runtime record without effort")
     base_url = str(anthropic.get("base_url") or "").strip().rstrip("/")
     if not re.match(r"^https?://", base_url, re.I):
         diagnostics.append("Anthropic Base URL is required and must start with http:// or https://")
@@ -1268,14 +1312,30 @@ def _claude_profile(
         runtime["default_role"] = default_role
     if effort is not None:
         runtime["effort"] = effort
+    if runtime.get("effort") is not None:
+        runtime["effort"] = str(runtime["effort"]).strip().casefold()
+    # Keep any legacy flat aliases coherent with the canonical runtime value so
+    # subsequent updates do not look like contradictory input to the planner.
+    if "effort" in profile:
+        profile["effort"] = runtime.get("effort")
+    if "claude_effort" in profile:
+        profile["claude_effort"] = runtime.get("effort")
+    if "claude_reasoning_effort" in profile:
+        profile["claude_reasoning_effort"] = runtime.get("effort")
     auth = anthropic.get("auth")
     auth = dict(auth) if isinstance(auth, dict) else {}
     auth["mode"] = auth_mode or auth.get("mode") or "api_key_helper"
     auth["secret_ref"] = channel.get("slug")
     anthropic["auth"] = auth
     protocols = profile.setdefault("protocols", {})
+    if not isinstance(protocols, dict):
+        protocols = {}
+        profile["protocols"] = protocols
     protocols["anthropic"] = anthropic
     runtimes = profile.setdefault("runtimes", {})
+    if not isinstance(runtimes, dict):
+        runtimes = {}
+        profile["runtimes"] = runtimes
     runtimes["claude_code"] = runtime
     return profile
 
@@ -1308,8 +1368,78 @@ def _journal_before_value(entry: dict[str, Any]) -> Any:
     before = _journal_decode(entry.get("before", _MISSING))
     if isinstance(before, dict) and before.get("keychain_restore_ref"):
         slug = str(before["keychain_restore_ref"])
+        allowed = {CLAUDE_ORIGINAL_KEY_SLUG, f"{CLAUDE_ORIGINAL_KEY_SLUG}-api-key"}
+        if slug not in allowed:
+            die("Claude journal 的 Keychain restore reference 非 SGate 创建；已停止恢复。")
         return keychain_get(slug)
     return before
+
+
+def _canonical_claude_settings_path(value: Any) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return str(Path(value).expanduser().resolve())
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _validate_claude_takeover(data: dict[str, Any]) -> dict[str, Any] | None:
+    """Validate persisted journal metadata before any settings/backup mutation."""
+    active = data.get("claude_active")
+    if active is not None and not isinstance(active, str):
+        die("claude_active 状态损坏（必须是 slug 或 null）；已停止，未修改配置。")
+    fallback = data.get("claude_fallback", _MISSING)
+    if fallback is not _MISSING and fallback is not None and not isinstance(fallback, dict):
+        die("旧版 claude_fallback 状态损坏；已停止，未修改配置。")
+    state = data.get("runtime_state")
+    if state is not None and not isinstance(state, dict):
+        die("runtime_state 状态损坏；已停止，未修改配置。")
+    claude_state = state.get(CLAUDE_TAKEOVER_KEY) if isinstance(state, dict) else None
+    if claude_state is not None and not isinstance(claude_state, dict):
+        die("Claude journal 状态损坏；已停止，未修改配置。")
+    takeover = claude_state.get("takeover") if isinstance(claude_state, dict) else None
+    if takeover is None:
+        return None
+    if not isinstance(takeover, dict):
+        die("Claude journal 格式损坏；已停止，未修改配置。")
+    target = _canonical_claude_settings_path(takeover.get("target_path"))
+    current = _canonical_claude_settings_path(str(CLAUDE_CODE_SETTINGS_PATH))
+    if target is None or current is None or target != current:
+        die("Claude journal target_path 非当前 settings.json；已停止，未修改配置。")
+    entries = takeover.get("entries")
+    if not isinstance(entries, list):
+        die("Claude journal entries 格式损坏；已停止，未修改配置。")
+    seen: set[str] = set()
+    allowed_refs = {CLAUDE_ORIGINAL_KEY_SLUG, f"{CLAUDE_ORIGINAL_KEY_SLUG}-api-key"}
+    for entry in entries:
+        if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
+            die("Claude journal entry 格式损坏；已停止，未修改配置。")
+        path = entry["path"]
+        if path not in _CLAUDE_JOURNAL_PATHS or path in seen:
+            die(f"Claude journal path 非 SGate 管理范围或重复：{path}")
+        if "before" not in entry or "applied" not in entry:
+            die(f"Claude journal entry 缺少 before/applied：{path}")
+        before = _journal_decode(entry["before"])
+        if isinstance(before, dict) and "keychain_restore_ref" in before:
+            if set(before) != {"keychain_restore_ref"} or str(before["keychain_restore_ref"]) not in allowed_refs:
+                die(f"Claude journal 的 Keychain restore reference 非 SGate 创建：{path}")
+        seen.add(path)
+    return takeover
+
+
+def _takeover_conflicts(settings: dict[str, Any], takeover: dict[str, Any] | None) -> list[str]:
+    if takeover is None:
+        return []
+    conflicts: list[str] = []
+    for entry in takeover.get("entries", []):
+        path = entry["path"]
+        local = _pointer_get(settings, path)
+        applied = _journal_decode(entry["applied"])
+        before = _journal_before_value(entry)
+        if local != applied and local != before:
+            conflicts.append(path)
+    return conflicts
 
 
 def _apply_claude_plan(
@@ -1317,8 +1447,8 @@ def _apply_claude_plan(
 ) -> dict[str, Any]:
     state = data.setdefault("runtime_state", {})
     claude_state = state.setdefault(CLAUDE_TAKEOVER_KEY, {})
-    takeover = claude_state.get("takeover")
-    if not isinstance(takeover, dict):
+    takeover = _validate_claude_takeover(data)
+    if takeover is None:
         takeover = {
             "target_path": str(CLAUDE_CODE_SETTINGS_PATH),
             "file_existed": CLAUDE_CODE_SETTINGS_PATH.exists(),
@@ -1331,6 +1461,9 @@ def _apply_claude_plan(
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         claude_state["takeover"] = takeover
+    conflicts = _takeover_conflicts(settings, takeover)
+    if conflicts:
+        die("Claude Code settings 在上次启用后被外部修改，拒绝覆盖：" + ", ".join(conflicts))
     entries = takeover.setdefault("entries", [])
     by_path = {entry.get("path"): entry for entry in entries if isinstance(entry, dict)}
     managed_now = list(plan.managed_paths)
@@ -1345,6 +1478,11 @@ def _apply_claude_plan(
         desired = plan.pointer_values.get(path, _MISSING)
         before = _pointer_get(settings, path)
         entry = by_path.get(path)
+        # Never trust a persisted pointer outside the closed managed set.  This
+        # also protects old/tampered journals before their ``applied`` value is
+        # updated below.
+        if entry is not None and path not in _CLAUDE_JOURNAL_PATHS:
+            raise ValueError(f"unsupported Claude journal path: {path}")
         if entry is None:
             entry = {
                 "path": path,
@@ -1372,6 +1510,9 @@ def _restore_claude_takeover(
         if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
             continue
         path = entry["path"]
+        if path not in _CLAUDE_JOURNAL_PATHS:
+            conflicts.append(f"{path} (unsupported journal path)")
+            continue
         local = _pointer_get(settings, path)
         applied = _journal_decode(entry.get("applied", _MISSING))
         try:
@@ -1475,6 +1616,16 @@ def select_claude_code_channel(
     protocols["anthropic"].setdefault("models_source", "explicit_map")
     settings = claude_settings_read()
     validate_claude_settings_shape(settings)
+    # Validate persisted takeover metadata before writing a backup or touching
+    # Keychain/journal state.  channels.json is user-editable input.
+    takeover = _validate_claude_takeover(data)
+    # A profile transition is allowed only when the current file still equals
+    # the journal's last applied values (or has already been restored to before).
+    # Preflight this before creating even a sanitized backup so a conflict is a
+    # true zero-write refusal.
+    conflicts = _takeover_conflicts(settings, takeover)
+    if conflicts:
+        die("Claude Code settings 在上次启用后被外部修改，拒绝覆盖：" + ", ".join(conflicts))
     backup = claude_settings_backup(settings)
     _apply_claude_plan(settings, data, plan)
     # Persist the journal before replacing settings so recovery never relies on a full snapshot.
@@ -1515,7 +1666,7 @@ def deactivate_claude_code_channel(slug: str | None = None, *, quiet: bool = Fal
     active = str(data.get("claude_active") or slug or "")
     state = data.get("runtime_state", {})
     claude_state = state.get(CLAUDE_TAKEOVER_KEY, {}) if isinstance(state, dict) else {}
-    takeover = claude_state.get("takeover") if isinstance(claude_state, dict) else None
+    takeover = _validate_claude_takeover(data)
     if not isinstance(takeover, dict):
         legacy = data.get("claude_fallback")
         if not quiet:
@@ -1524,10 +1675,10 @@ def deactivate_claude_code_channel(slug: str | None = None, *, quiet: bool = Fal
             else:
                 print_note("当前没有 SGate pointer journal，未修改 Claude Code 配置。", kind="warn")
         return
-    target_path = str(Path(str(takeover.get("target_path", ""))).expanduser().resolve())
-    current_path = str(CLAUDE_CODE_SETTINGS_PATH.expanduser().resolve())
+    target_path = _canonical_claude_settings_path(takeover.get("target_path"))
+    current_path = _canonical_claude_settings_path(str(CLAUDE_CODE_SETTINGS_PATH))
     if target_path != current_path:
-        die(f"Claude journal 属于 {target_path}，当前配置是 {current_path}；已停止恢复，未修改配置。")
+        die(f"Claude journal 属于 {target_path or '(无效路径)'}，当前配置是 {current_path}；已停止恢复，未修改配置。")
     settings = claude_settings_read()
     validate_claude_settings_shape(settings)
     backup = claude_settings_backup(settings)

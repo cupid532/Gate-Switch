@@ -482,6 +482,68 @@ class SGateTests(unittest.TestCase):
                 )
             self.assertEqual(sgate.CLAUDE_CODE_SETTINGS_PATH.read_text(encoding="utf-8"), before)
 
+    def test_claude_journal_target_path_is_fail_closed_before_restore(self) -> None:
+        sgate.CLAUDE_CODE_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        sgate.CLAUDE_CODE_SETTINGS_PATH.write_text(json.dumps({"model": "before"}), encoding="utf-8")
+        sgate.select_claude_code_channel(
+            "test", anthropic_base_url="https://a.example", default_role="sonnet", effort="high",
+            model_map={"opus": "o", "sonnet": "s", "haiku": "h"},
+        )
+        settings_before = sgate.CLAUDE_CODE_SETTINGS_PATH.read_bytes()
+        backups_before = sorted(sgate.CLAUDE_BACKUP_DIR.glob("*.bak"))
+        data = json.loads(sgate.CHANNELS_PATH.read_text(encoding="utf-8"))
+        data["runtime_state"]["claude_code"]["takeover"]["target_path"] = str(Path(self.temp.name) / "other.json")
+        sgate.CHANNELS_PATH.write_text(json.dumps(data), encoding="utf-8")
+        with self.assertRaises(SystemExit):
+            sgate.deactivate_claude_code_channel("test")
+        self.assertEqual(sgate.CLAUDE_CODE_SETTINGS_PATH.read_bytes(), settings_before)
+        self.assertEqual(sorted(sgate.CLAUDE_BACKUP_DIR.glob("*.bak")), backups_before)
+
+    def test_claude_profile_transition_rejects_external_edit_without_writes(self) -> None:
+        sgate.CLAUDE_CODE_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        sgate.CLAUDE_CODE_SETTINGS_PATH.write_text(json.dumps({"model": "before"}), encoding="utf-8")
+        maps = {"opus": "o", "sonnet": "s", "haiku": "h"}
+        sgate.select_claude_code_channel(
+            "test", anthropic_base_url="https://a.example", default_role="sonnet", effort="high", model_map=maps,
+        )
+        data_before = sgate.CHANNELS_PATH.read_bytes()
+        backups_before = sorted(sgate.CLAUDE_BACKUP_DIR.glob("*.bak"))
+        edited = json.loads(sgate.CLAUDE_CODE_SETTINGS_PATH.read_text(encoding="utf-8"))
+        edited["model"] = "user-model"
+        sgate.CLAUDE_CODE_SETTINGS_PATH.write_text(json.dumps(edited), encoding="utf-8")
+        with self.assertRaises(SystemExit):
+            sgate.select_claude_code_channel(
+                "second", anthropic_base_url="https://b.example", default_role="opus", effort="low", model_map=maps,
+            )
+        self.assertEqual(sgate.CHANNELS_PATH.read_bytes(), data_before)
+        self.assertEqual(sorted(sgate.CLAUDE_BACKUP_DIR.glob("*.bak")), backups_before)
+
+    def test_claude_effort_runtime_is_authoritative_and_conflicts_fail(self) -> None:
+        profile = {
+            "slug": "test",
+            "protocols": {"anthropic": {"base_url": "https://a.example"}},
+            "runtimes": {"claude_code": {
+                "default_role": "sonnet", "effort": "high",
+                "model_map": {"opus": "o", "sonnet": "s", "haiku": "h"},
+            }},
+            "claude_effort": "low",
+        }
+        plan = sgate.compile_claude_managed_values(profile)
+        self.assertFalse(plan.supported)
+        self.assertTrue(any("effort conflict" in item for item in plan.diagnostics))
+
+    def test_claude_journal_distinguishes_json_null_from_missing(self) -> None:
+        sgate.CLAUDE_CODE_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        sgate.CLAUDE_CODE_SETTINGS_PATH.write_text(json.dumps({"model": None}), encoding="utf-8")
+        sgate.select_claude_code_channel(
+            "test", anthropic_base_url="https://a.example", default_role="sonnet", effort="high",
+            model_map={"opus": "o", "sonnet": "s", "haiku": "h"},
+        )
+        sgate.deactivate_claude_code_channel("test")
+        restored = json.loads(sgate.CLAUDE_CODE_SETTINGS_PATH.read_text(encoding="utf-8"))
+        self.assertIn("model", restored)
+        self.assertIsNone(restored["model"])
+
     def test_claude_desktop_use_never_rewrites_desktop_json(self) -> None:
         original = {"mcpServers": {"demo": {"command": "demo"}}, "other": True}
         sgate.CLAUDE_DESKTOP_CONFIG_PATH.write_text(json.dumps(original), encoding="utf-8")
