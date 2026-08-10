@@ -15,9 +15,11 @@ import getpass
 import json
 import os
 import re
+import socket
 import select
 import shlex
 import shutil
+import ssl
 import sqlite3
 import subprocess
 import sys
@@ -36,6 +38,17 @@ from urllib.parse import urlsplit
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+MIN_PYTHON = (3, 10)
+VERSION = "2.0.0"
+if sys.version_info < MIN_PYTHON:
+    print(
+        "SGate 需要 Python 3.10 或更高版本；当前为 "
+        f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}。\n"
+        "请安装新版 Python 后使用该解释器运行 sgate（例如 python3.12 sgate.py）。",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
 
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser()
 CONFIG_PATH = CODEX_HOME / "config.toml"
@@ -1307,6 +1320,145 @@ def _claude_gateway_is_first_party(base_url: str) -> bool:
     return hostname == "api.anthropic.com"
 
 
+def normalize_anthropic_gateway_root(value: str) -> str:
+    """Validate and canonicalize an Anthropic gateway root, never an endpoint."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("Anthropic Base URL 不能为空")
+    raw = value.strip()
+    try:
+        parsed = urlsplit(raw)
+        port = parsed.port  # Force validation of malformed ports.
+    except ValueError as exc:
+        raise ValueError(f"Anthropic Base URL 无效：{exc}") from exc
+    if parsed.scheme.casefold() not in ("http", "https"):
+        raise ValueError("Anthropic Base URL 必须使用 http:// 或 https://")
+    if not parsed.hostname or parsed.username or parsed.password:
+        raise ValueError("Anthropic Base URL 必须包含主机且不得包含凭据")
+    if parsed.query or parsed.fragment:
+        raise ValueError("Anthropic Base URL 不得包含 query 或 fragment")
+    host = parsed.hostname.casefold()
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    default_port = (parsed.scheme.casefold() == "https" and port == 443) or (
+        parsed.scheme.casefold() == "http" and port == 80
+    )
+    authority = host if port is None or default_port else f"{host}:{port}"
+    path = re.sub(r"/+", "/", parsed.path or "").rstrip("/")
+    lowered = path.casefold()
+    if re.search(r"(?:^|/)v1(?:/messages)?$", lowered) or lowered.endswith("/messages"):
+        raise ValueError("Anthropic Base URL 必须是 gateway root，不能包含 /v1 或 /v1/messages")
+    return f"{parsed.scheme.casefold()}://{authority}{path}"
+
+
+def anthropic_messages_url(gateway_root: str) -> str:
+    return normalize_anthropic_gateway_root(gateway_root) + "/v1/messages"
+
+
+def _redact_diagnostic_text(value: Any) -> str:
+    text = str(value or "")
+    text = re.sub(
+        r'(?i)(["\']?(?:x-api-key|authorization|api[-_ ]?key|token|secret)["\']?\s*[=:]\s*)(["\']?)[^,;\s}\]\"\']+\2',
+        r'\1\2[REDACTED]\2', text,
+    )
+    return text[:500]
+
+
+def anthropic_messages_headers(gateway_root: str, api_key: str, *, beta: str | None = None) -> dict[str, str]:
+    """Build Messages headers without exposing the secret to logs or config."""
+    headers = {
+        "content-type": "application/json",
+        "accept": "application/json",
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+    }
+    if _claude_gateway_is_first_party(gateway_root) and beta:
+        headers["anthropic-beta"] = beta
+    return headers
+
+
+def classify_anthropic_error(*, status: int | None = None, error: BaseException | str | None = None,
+                             body: str = "") -> str:
+    text = _redact_diagnostic_text(body or error or "").casefold()
+    if isinstance(error, (socket.timeout, TimeoutError)) or "timed out" in text:
+        return "network/timeout"
+    if isinstance(error, ssl.SSLError) or "ssl" in text or "certificate" in text:
+        return "network/tls"
+    if isinstance(error, (urllib.error.URLError, OSError)):
+        return "network"
+    if status in (401, 403):
+        return "auth/permission"
+    if status == 404:
+        return "url/not-found"
+    if status == 429:
+        return "rate-limit"
+    if status is not None and 500 <= status <= 599:
+        return "upstream/5xx"
+    if status == 400:
+        if any(word in text for word in ("beta", "header", "schema", "invalid_request", "anthropic-version")):
+            return "request/400-schema-or-beta"
+        return "request/400"
+    if status is not None and 400 <= status <= 499:
+        return "request/4xx"
+    return "unknown"
+
+
+def diagnose_anthropic_messages(slug: str, *, dry_run: bool = False, timeout: float = 10.0) -> dict[str, Any]:
+    """Run a redacted, non-interactive Messages protocol probe."""
+    data = load_channels()
+    channel = data.get("channels", {}).get(slug)
+    if not isinstance(channel, dict):
+        return {"slug": slug, "category": "config", "ok": False, "detail": "渠道不存在"}
+    anthropic, runtime = _anthropic_profile_sections(channel)
+    root = anthropic.get("base_url")
+    try:
+        root = normalize_anthropic_gateway_root(root)
+        url = anthropic_messages_url(root)
+    except ValueError as exc:
+        return {"slug": slug, "category": "url/invalid", "ok": False, "detail": str(exc)}
+    model_map = runtime.get("model_map") if isinstance(runtime.get("model_map"), dict) else {}
+    model = model_map.get(runtime.get("default_role"))
+    if not isinstance(model, str) or not model.strip():
+        return {"slug": slug, "url": url, "category": "model/missing", "ok": False, "detail": "默认 alias 没有真实模型 ID"}
+    result: dict[str, Any] = {"slug": slug, "url": url, "model": model, "dry_run": dry_run}
+    if dry_run:
+        result.update({"ok": True, "category": "dry-run", "headers": sorted(anthropic_messages_headers(root, "[keychain]"))})
+        return result
+    try:
+        api_key = keychain_get(slug)
+        payload = {"model": model, "max_tokens": 1, "messages": [{"role": "user", "content": "health check"}]}
+        request = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"),
+                                         headers=anthropic_messages_headers(root, api_key), method="POST")
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read(4096).decode("utf-8", "replace")
+            status = int(getattr(response, "status", 200))
+        result.update({"ok": 200 <= status < 300, "status": status,
+                       "category": "success" if 200 <= status < 300 else classify_anthropic_error(status=status, body=raw),
+                       "detail": "Messages 请求成功" if 200 <= status < 300 else _redact_diagnostic_text(raw)})
+    except urllib.error.HTTPError as exc:
+        raw = exc.read(4096).decode("utf-8", "replace")
+        result.update({"ok": False, "status": exc.code, "category": classify_anthropic_error(status=exc.code, body=raw),
+                       "detail": _redact_diagnostic_text(raw)})
+    except Exception as exc:
+        result.update({"ok": False, "category": classify_anthropic_error(error=exc),
+                       "detail": _redact_diagnostic_text(exc)})
+    return result
+
+
+def print_anthropic_diagnostic(slug: str, *, dry_run: bool = False, timeout: float = 10.0,
+                               json_output: bool = False) -> bool:
+    result = diagnose_anthropic_messages(slug, dry_run=dry_run, timeout=timeout)
+    if json_output:
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    else:
+        print_heading("Claude Messages 协议诊断", f"渠道 {slug}")
+        for label, key in (("阶段", "category"), ("请求地址", "url"), ("模型", "model"), ("HTTP", "status")):
+            if key in result:
+                print_field(label, result[key], tone="ok" if result.get("ok") else "warn")
+        print_note(str(result.get("detail") or ("仅校验请求契约，未发出网络请求" if dry_run else "完成")),
+                   kind="ok" if result.get("ok") else "err")
+    return bool(result.get("ok"))
+
+
 def compile_claude_managed_values(
     profile: dict[str, Any], capabilities: dict[str, Any] | None = None,
 ) -> ClaudeManagedPlan:
@@ -1340,11 +1492,11 @@ def compile_claude_managed_values(
         diagnostics.append("Anthropic Base URL is required in protocols.anthropic.base_url; shared OpenAI base_url is not inferred")
         base_url = ""
     else:
-        base_url = raw_base_url.strip().rstrip("/")
-        if not re.match(r"^https?://", base_url, re.I):
-            diagnostics.append("Anthropic Base URL must start with http:// or https://")
-        if re.search(r"/v1$", base_url, re.I):
-            diagnostics.append("Anthropic Base URL must be the gateway root, not a URL ending in /v1")
+        try:
+            base_url = normalize_anthropic_gateway_root(raw_base_url)
+        except ValueError as exc:
+            base_url = ""
+            diagnostics.append(str(exc))
     model_map = runtime.get("model_map")
     if model_map is not None and not isinstance(model_map, dict):
         diagnostics.append("model_map must be an object")
@@ -1783,6 +1935,7 @@ def select_claude_code_channel(
     model: str | None = None,
     selected_models: list[str] | None = None,
     selected_efforts: list[str] | None = None,
+    dry_run: bool = False,
 ) -> None:
     """Activate a complete explicit Claude profile; ``model`` is map-all only."""
     data = load_channels()
@@ -1801,6 +1954,15 @@ def select_claude_code_channel(
     plan = compile_claude_managed_values(profile)
     if not plan.supported:
         die("Claude 配置不完整：" + "；".join(plan.diagnostics))
+    if dry_run:
+        print_heading("Claude Code 配置预演", f"渠道 {slug}；不会写入文件或 Keychain")
+        print_field("Anthropic URL", plan.desired["/env/ANTHROPIC_BASE_URL"])
+        print_field("Messages URL", anthropic_messages_url(plan.desired["/env/ANTHROPIC_BASE_URL"]))
+        print_field("默认 alias", plan.desired["/model"])
+        for role in CLAUDE_ROLES:
+            print_field(f"{role} →", plan.desired[f"/env/ANTHROPIC_DEFAULT_{role.upper()}_MODEL"])
+        print_note("预演完成：未读取密钥，未修改配置。", kind="ok")
+        return
     protocols = profile["protocols"]
     runtimes = profile["runtimes"]
     protocols["anthropic"].pop("migration_status", None)
@@ -1941,7 +2103,7 @@ def deactivate_claude_code_channel(slug: str | None = None, *, quiet: bool = Fal
 def configure_claude_code_channel(
     slug: str | None = None, *, anthropic_base_url: str | None = None,
     model_map: dict[str, str] | None = None, default_role: str | None = None,
-    effort: str | None = None, auth_mode: str | None = None,
+    effort: str | None = None, auth_mode: str | None = None, dry_run: bool = False,
 ) -> None:
     slug = slug or choose_channel("Claude Code：选择渠道", runtime="claude")
     if not slug:
@@ -2006,7 +2168,7 @@ def configure_claude_code_channel(
             return
     select_claude_code_channel(
         slug, anthropic_base_url=anthropic_base_url, model_map=model_map,
-        default_role=default_role, effort=effort, auth_mode=auth_mode,
+        default_role=default_role, effort=effort, auth_mode=auth_mode, dry_run=dry_run,
     )
 
 
@@ -2074,6 +2236,7 @@ def claude_desktop_interactive() -> None:
                 f"Code tab：{info['model']} · {info['effort']} · {info['base_url']}",
                 [
                     ("use", "[Code tab] 选择渠道、模型和思考强度"),
+                    ("doctor", "[诊断] 检查当前渠道 /v1/messages 协议"),
                     ("status", "[状态] 查看 Desktop 配置、MCP 和 Code tab 状态"),
                     ("back", "[返回] 回到工具选择"),
                 ],
@@ -2084,6 +2247,9 @@ def claude_desktop_interactive() -> None:
             if choice == "use":
                 configure_claude_code_channel()
                 print_note("上述选择会应用到 Claude Desktop 的 Code tab。", kind="ok")
+            elif choice == "doctor":
+                active = str(load_channels().get("claude_active") or "")
+                print_anthropic_diagnostic(active) if active else print_note("当前没有启用 Claude 渠道。", kind="warn")
             elif choice == "status":
                 claude_desktop_status()
             pause_after_action()
@@ -2100,6 +2266,7 @@ def claude_code_interactive() -> None:
             choice = terminal_menu(title, [
                 ("use", "[切换] 选择渠道、模型和思考强度"),
                 ("configure", "[配置] 重新选择当前渠道的模型和思考强度"),
+                ("doctor", "[诊断] 检查当前渠道 /v1/messages 协议"),
                 ("disable", "[停用] 恢复 Claude Code 原有配置"),
                 ("status", "[状态] 查看 Claude Code 实际配置"),
                 ("back", "[返回] 回到工具选择"),
@@ -2110,6 +2277,9 @@ def claude_code_interactive() -> None:
                 configure_claude_code_channel()
             elif choice == "disable":
                 deactivate_claude_code_channel()
+            elif choice == "doctor":
+                active = str(load_channels().get("claude_active") or "")
+                print_anthropic_diagnostic(active) if active else print_note("当前没有启用 Claude 渠道。", kind="warn")
             elif choice == "status":
                 print_claude_code_status()
             pause_after_action()
@@ -3999,6 +4169,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="sgate",
         description="切换 Codex、OpenCode、Claude Code 及 Claude Desktop Code tab 渠道；API Key 存储在 macOS Keychain。",
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     sub = parser.add_subparsers(dest="command")
 
     p_add = sub.add_parser("add", help="添加/更新渠道，并自动拉取模型列表")
@@ -4068,6 +4239,7 @@ def build_parser() -> argparse.ArgumentParser:
             "--map", dest="model_maps", action="append", default=[], metavar="ROLE=MODEL",
             help="显式 alias 映射，可重复：opus=... / sonnet=... / haiku=...",
         )
+        command.add_argument("--dry-run", action="store_true", help="仅校验并展示计划，不读取密钥或写配置")
         command.add_argument("--map-all", metavar="MODEL", help="将同一模型显式映射到三个 alias")
         command.add_argument("--model", help="兼容参数，等同 --map-all 并打印提示")
         command.add_argument("--default-role", choices=CLAUDE_ROLES)
@@ -4079,12 +4251,18 @@ def build_parser() -> argparse.ArgumentParser:
         )
 
     p_cc = sub.add_parser("claude-code", help="切换 Claude Code Anthropic 渠道与 alias 映射")
-    p_cc.add_argument("action", nargs="?", choices=("use", "configure", "config", "disable", "status"), default=None)
+    p_cc.add_argument("action", nargs="?", choices=("use", "configure", "config", "disable", "status", "doctor"), default=None)
     add_claude_arguments(p_cc)
 
     p_cd = sub.add_parser("claude-desktop", help="配置 Desktop Code tab 或只读查看 MCP 状态")
-    p_cd.add_argument("action", nargs="?", choices=("use", "configure", "config", "disable", "status"), default=None)
+    p_cd.add_argument("action", nargs="?", choices=("use", "configure", "config", "disable", "status", "doctor"), default=None)
     add_claude_arguments(p_cd)
+
+    p_messages = sub.add_parser("claude-doctor", help="对 /v1/messages 执行脱敏连接与协议诊断")
+    p_messages.add_argument("slug")
+    p_messages.add_argument("--dry-run", action="store_true", help="只验证 URL、模型与请求契约")
+    p_messages.add_argument("--timeout", type=float, default=10.0)
+    p_messages.add_argument("--json", action="store_true", dest="json_output", help="输出机器可读 JSON")
 
     p_token = sub.add_parser("token", help=argparse.SUPPRESS)
     p_token.add_argument("slug")
@@ -4131,6 +4309,10 @@ def main() -> None:
         app_doctor()
     elif args.command == "run":
         os.execvp("codex", ["codex", *args.args])
+    elif args.command == "claude-doctor":
+        if not print_anthropic_diagnostic(args.slug, dry_run=args.dry_run, timeout=args.timeout,
+                                          json_output=args.json_output):
+            raise SystemExit(1)
     elif args.command == "opencode":
         slugs = args.slug or []
         if args.action == "status":
@@ -4167,9 +4349,16 @@ def main() -> None:
             "default_role": args.default_role,
             "effort": args.effort,
             "auth_mode": args.auth_mode,
+            "dry_run": args.dry_run,
         }
         if args.action == "status":
             print_claude_code_status() if args.command == "claude-code" else claude_desktop_status()
+        elif args.action == "doctor":
+            slug = args.slug or str(load_channels().get("claude_active") or "")
+            if not slug:
+                die("Claude doctor 需要渠道 slug，且当前没有启用渠道")
+            if not print_anthropic_diagnostic(slug, dry_run=args.dry_run):
+                raise SystemExit(1)
         elif args.action == "use":
             if not args.slug:
                 die(f"{'Claude Code' if args.command == 'claude-code' else 'Claude Desktop'} use 需要渠道 slug")

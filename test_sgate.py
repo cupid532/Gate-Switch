@@ -4,7 +4,9 @@ import importlib.util
 import json
 import os
 import tempfile
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
@@ -443,9 +445,108 @@ class SGateTests(unittest.TestCase):
         }
         plan = sgate.compile_claude_managed_values(base)
         self.assertFalse(plan.supported)
-        self.assertTrue(any("ending in /v1" in item for item in plan.diagnostics))
+        self.assertTrue(any("/v1" in item for item in plan.diagnostics))
         self.assertTrue(any("secret_ref" in item for item in plan.diagnostics))
         self.assertNotIn("apiKeyHelper", plan.desired)
+
+    def test_anthropic_gateway_root_normalization_is_strict(self) -> None:
+        self.assertEqual(sgate.normalize_anthropic_gateway_root("HTTPS://API.Anthropic.com:443/"),
+                         "https://api.anthropic.com")
+        self.assertEqual(sgate.anthropic_messages_url("http://127.0.0.1:8080/gateway/"),
+                         "http://127.0.0.1:8080/gateway/v1/messages")
+        for bad in ("example.test", "https://u:p@example.test", "https://example.test/v1",
+                    "https://example.test/v1/messages", "https://example.test/messages", "https://example.test?key=x"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                sgate.normalize_anthropic_gateway_root(bad)
+
+    def test_anthropic_messages_mock_contract_success_and_headers(self) -> None:
+        captured = {}
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                captured["path"] = self.path
+                captured["headers"] = {key.casefold(): value for key, value in self.headers.items()}
+                captured["body"] = json.loads(self.rfile.read(int(self.headers["content-length"])))
+                response = json.dumps({"id": "msg_mock", "type": "message", "content": []}).encode()
+                self.send_response(200)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(response)))
+                self.end_headers()
+                self.wfile.write(response)
+
+            def log_message(self, *_args):
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            data = sgate.load_channels()
+            channel = data["channels"]["test"]
+            channel["protocols"] = {"anthropic": {"base_url": f"http://127.0.0.1:{server.server_port}"}}
+            channel["runtimes"] = {"claude_code": {"default_role": "sonnet", "effort": "high",
+                                                     "model_map": {"opus": "mock-o", "sonnet": "mock-s", "haiku": "mock-h"}}}
+            sgate.save_channels(data)
+            result = sgate.diagnose_anthropic_messages("test", timeout=2)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(2)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(captured["path"], "/v1/messages")
+        self.assertEqual(captured["headers"]["x-api-key"], "secret-for-test")
+        self.assertEqual(captured["headers"]["anthropic-version"], "2023-06-01")
+        self.assertNotIn("anthropic-beta", captured["headers"])
+        self.assertEqual(captured["body"], {"model": "mock-s", "max_tokens": 1,
+                                             "messages": [{"role": "user", "content": "health check"}]})
+
+    def test_anthropic_messages_mock_400_classification_and_redaction(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers["content-length"]))
+                response = b'{"error":"invalid schema beta header", "token":"do-not-print"}'
+                self.send_response(400)
+                self.send_header("content-length", str(len(response)))
+                self.end_headers()
+                self.wfile.write(response)
+
+            def log_message(self, *_args):
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            data = sgate.load_channels()
+            channel = data["channels"]["test"]
+            channel["protocols"] = {"anthropic": {"base_url": f"http://127.0.0.1:{server.server_port}"}}
+            channel["runtimes"] = {"claude_code": {"default_role": "sonnet", "effort": "high",
+                                                     "model_map": {"opus": "o", "sonnet": "s", "haiku": "h"}}}
+            sgate.save_channels(data)
+            result = sgate.diagnose_anthropic_messages("test", timeout=2)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(2)
+        self.assertEqual(result["category"], "request/400-schema-or-beta")
+        self.assertNotIn("do-not-print", result["detail"])
+
+    def test_anthropic_error_status_categories_and_dry_run(self) -> None:
+        self.assertEqual(sgate.classify_anthropic_error(status=401), "auth/permission")
+        self.assertEqual(sgate.classify_anthropic_error(status=403), "auth/permission")
+        self.assertEqual(sgate.classify_anthropic_error(status=404), "url/not-found")
+        self.assertEqual(sgate.classify_anthropic_error(status=429), "rate-limit")
+        self.assertEqual(sgate.classify_anthropic_error(status=503), "upstream/5xx")
+        data = sgate.load_channels()
+        channel = data["channels"]["test"]
+        channel["protocols"] = {"anthropic": {"base_url": "https://api.anthropic.com"}}
+        channel["runtimes"] = {"claude_code": {"default_role": "sonnet", "effort": "high",
+                                                 "model_map": {"opus": "o", "sonnet": "s", "haiku": "h"}}}
+        sgate.save_channels(data)
+        with patch.object(sgate, "keychain_get") as get_key:
+            result = sgate.diagnose_anthropic_messages("test", dry_run=True)
+        get_key.assert_not_called()
+        self.assertEqual(result["category"], "dry-run")
 
     def test_claude_profile_malformed_containers_fail_closed(self) -> None:
         for profile in ({"protocols": []}, {"protocols": {"anthropic": []}}, {"runtimes": []}, {"runtimes": {"claude_code": []}}):
