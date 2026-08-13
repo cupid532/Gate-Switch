@@ -734,6 +734,49 @@ class SGateTests(unittest.TestCase):
         self.assertEqual(sgate.CHANNELS_PATH.read_bytes(), data_before)
         self.assertEqual(sorted(sgate.CLAUDE_BACKUP_DIR.glob("*.bak")), backups_before)
 
+    def test_claude_full_replacement_retakes_over_instead_of_failing(self) -> None:
+        sgate.CLAUDE_CODE_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        sgate.CLAUDE_CODE_SETTINGS_PATH.write_text(json.dumps({"model": "before"}), encoding="utf-8")
+        maps = {"opus": "o", "sonnet": "s", "haiku": "h"}
+        sgate.select_claude_code_channel(
+            "test", anthropic_base_url="https://a.example", default_role="sonnet", effort="high", model_map=maps,
+        )
+        # Another switcher fully replaces settings.json with a different provider
+        # that coincidentally reuses some key names (ANTHROPIC_BASE_URL and the
+        # ANTHROPIC_DEFAULT_*_MODEL role aliases), plus an inline auth token.
+        replaced = {
+            "env": {
+                "ANTHROPIC_AUTH_TOKEN": "other-secret",
+                "ANTHROPIC_BASE_URL": "https://other.example",
+                "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-5",
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-5",
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL": "claude-haiku-4-5",
+            }
+        }
+        sgate.CLAUDE_CODE_SETTINGS_PATH.write_text(json.dumps(replaced), encoding="utf-8")
+        with patch.object(sgate, "keychain_set") as save_key:
+            sgate.select_claude_code_channel(
+                "second", anthropic_base_url="https://b.example", default_role="opus", effort="low", model_map=maps,
+            )
+        settings = json.loads(sgate.CLAUDE_CODE_SETTINGS_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(settings["model"], "opus")
+        self.assertEqual(settings["effortLevel"], "low")
+        self.assertEqual(settings["env"]["ANTHROPIC_BASE_URL"], "https://b.example")
+        self.assertEqual(settings["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"], "o")
+        self.assertEqual(settings["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"], "s")
+        self.assertEqual(settings["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "h")
+        # The replaced auth token is preserved in Keychain for a later restore.
+        self.assertNotIn("ANTHROPIC_AUTH_TOKEN", settings["env"])
+        save_key.assert_called_once_with(sgate.CLAUDE_ORIGINAL_KEY_SLUG, "other-secret")
+        data = json.loads(sgate.CHANNELS_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(data["claude_active"], "second")
+        entry = next(
+            item for item in data["runtime_state"]["claude_code"]["takeover"]["entries"]
+            if item["path"] == "/env/ANTHROPIC_BASE_URL"
+        )
+        self.assertEqual(entry["before"], "https://other.example")
+        self.assertEqual(entry["applied"], "https://b.example")
+
     def test_claude_effort_runtime_is_authoritative_and_conflicts_fail(self) -> None:
         profile = {
             "slug": "test",

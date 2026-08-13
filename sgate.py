@@ -40,7 +40,7 @@ from pathlib import Path
 from typing import Any
 
 MIN_PYTHON = (3, 10)
-VERSION = "2.0.0"
+VERSION = "2.0.3"
 if sys.version_info < MIN_PYTHON:
     print(
         "SGate 需要 Python 3.10 或更高版本；当前为 "
@@ -108,6 +108,7 @@ _CLAUDE_JOURNAL_PATHS = frozenset({
     "/model",
     "/effortLevel",
     "/apiKeyHelper",
+    "/permissions/deny",
     "/env/ANTHROPIC_BASE_URL",
     "/env/ANTHROPIC_MODEL",
     "/env/ANTHROPIC_SMALL_FAST_MODEL",
@@ -1081,6 +1082,13 @@ def validate_claude_settings_shape(settings: dict[str, Any]) -> None:
     """Fail closed before any backup, Keychain, journal, or settings write."""
     if "env" in settings and not isinstance(settings.get("env"), dict):
         die("Claude Code settings.json 的 env 必须是 JSON 对象；已停止，未修改任何配置。")
+    permissions = settings.get("permissions")
+    if permissions is not None and not isinstance(permissions, dict):
+        die("Claude Code settings.json 的 permissions 必须是 JSON 对象；已停止，未修改任何配置。")
+    if isinstance(permissions, dict) and "deny" in permissions:
+        deny = permissions.get("deny")
+        if not isinstance(deny, list) or not all(isinstance(item, str) for item in deny):
+            die("Claude Code settings.json 的 permissions.deny 必须是字符串数组；已停止，未修改任何配置。")
 
 
 def _safe_claude_settings_snapshot(settings: dict[str, Any]) -> dict[str, Any]:
@@ -1294,6 +1302,11 @@ def _anthropic_profile_sections(profile: dict[str, Any]) -> tuple[dict[str, Any]
         runtime = {
             "default_role": profile.get("default_role") or profile.get("claude_default_role"),
             "effort": profile.get("effort") or profile.get("claude_effort") or profile.get("claude_reasoning_effort"),
+            "disabled_tools": (
+                profile.get("disabled_tools") if isinstance(profile.get("disabled_tools"), list)
+                else profile.get("claude_disabled_tools") if isinstance(profile.get("claude_disabled_tools"), list)
+                else None
+            ),
             "model_map": (
                 profile.get("model_map") if isinstance(profile.get("model_map"), dict)
                 else flat_map if isinstance(flat_map, dict) else None
@@ -1376,6 +1389,19 @@ def anthropic_messages_headers(gateway_root: str, api_key: str, *, beta: str | N
     return headers
 
 
+def system_ssl_context() -> ssl.SSLContext:
+    """Build a verified TLS context, including macOS system roots when needed."""
+    context = ssl.create_default_context()
+    if context.cert_store_stats().get("x509_ca", 0):
+        return context
+    for candidate in (Path("/etc/ssl/cert.pem"), Path("/opt/homebrew/etc/ca-certificates/cert.pem")):
+        if candidate.is_file():
+            context.load_verify_locations(cafile=str(candidate))
+            if context.cert_store_stats().get("x509_ca", 0):
+                return context
+    return context
+
+
 def classify_anthropic_error(*, status: int | None = None, error: BaseException | str | None = None,
                              body: str = "") -> str:
     text = _redact_diagnostic_text(body or error or "").casefold()
@@ -1428,7 +1454,7 @@ def diagnose_anthropic_messages(slug: str, *, dry_run: bool = False, timeout: fl
         payload = {"model": model, "max_tokens": 1, "messages": [{"role": "user", "content": "health check"}]}
         request = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"),
                                          headers=anthropic_messages_headers(root, api_key), method="POST")
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with urllib.request.urlopen(request, timeout=timeout, context=system_ssl_context()) as response:
             raw = response.read(4096).decode("utf-8", "replace")
             status = int(getattr(response, "status", 200))
         result.update({"ok": 200 <= status < 300, "status": status,
@@ -1530,6 +1556,12 @@ def compile_claude_managed_values(
         diagnostics.append("effort must be a string")
     if effort not in CLAUDE_EFFORTS:
         diagnostics.append("effort must be one of: low, medium, high")
+    raw_disabled_tools = runtime.get("disabled_tools")
+    if raw_disabled_tools is not None and (
+        not isinstance(raw_disabled_tools, list)
+        or not all(isinstance(item, str) and item.strip() for item in raw_disabled_tools)
+    ):
+        diagnostics.append("disabled_tools must be an array of non-empty tool names")
     raw_auth = anthropic.get("auth", _MISSING)
     if raw_auth is not _MISSING and not isinstance(raw_auth, dict):
         diagnostics.append("protocols.anthropic.auth must be an object")
@@ -1615,6 +1647,7 @@ def _claude_profile(
     channel: dict[str, Any], *, anthropic_base_url: str | None = None,
     model_map: dict[str, str] | None = None, default_role: str | None = None,
     effort: str | None = None, auth_mode: str | None = None,
+    disabled_tools: list[str] | None = None,
 ) -> dict[str, Any]:
     profile = json.loads(json.dumps(channel, ensure_ascii=False))
     shape_errors = _claude_profile_shape_diagnostics(profile)
@@ -1626,14 +1659,19 @@ def _claude_profile(
     if anthropic_base_url is not None:
         anthropic["base_url"] = anthropic_base_url
     if model_map is not None:
-        # The Anthropic catalog is a list; the runtime role mapping is the
-        # separate authoritative dictionary.
-        anthropic["models"] = list(dict.fromkeys(model_map.values()))
+        # Role mappings are an active configuration, not a replacement for
+        # the channel's fetched model catalog. Replacing the catalog here made
+        # the next interactive selection offer only the last mapped model.
+        anthropic["models"] = list(dict.fromkeys(
+            _normalized_values(anthropic.get("models")) + list(model_map.values())
+        ))
         runtime["model_map"] = dict(model_map)
     if default_role is not None:
         runtime["default_role"] = default_role
     if effort is not None:
         runtime["effort"] = effort
+    if disabled_tools is not None:
+        runtime["disabled_tools"] = list(dict.fromkeys(disabled_tools))
     if runtime.get("effort") is not None:
         runtime["effort"] = str(runtime["effort"]).strip().casefold()
     # Keep any legacy flat aliases coherent with the canonical runtime value so
@@ -1777,6 +1815,87 @@ def _takeover_conflicts(settings: dict[str, Any], takeover: dict[str, Any] | Non
     return conflicts
 
 
+def _claude_takeover_is_detached(settings: dict[str, Any], takeover: dict[str, Any] | None) -> bool:
+    """Return whether a journal survives but its managed settings were fully replaced.
+
+    A partial edit remains a conflict so SGate never silently overwrites a user
+    change. A complete replacement is different: Claude Code, a sync tool, or
+    another switcher can replace ``settings.json`` and leave an orphaned journal
+    behind. Such a replacement often reuses the same key names (for example
+    ``ANTHROPIC_BASE_URL``), so "fully replaced" is detected by whether any of
+    the values SGate wrote are still present: if none survive, the next explicit
+    channel selection can safely establish a new baseline from the current file.
+    """
+    if not isinstance(takeover, dict):
+        return False
+    entries = takeover.get("entries")
+    if not isinstance(entries, list) or not entries:
+        return False
+    concrete_applied = False
+    still_applied = False
+    for entry in entries:
+        if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
+            return False
+        applied = _journal_entry_value(entry, "applied")
+        if _is_missing(applied):
+            continue
+        concrete_applied = True
+        current = _pointer_get(settings, entry["path"])
+        if not _is_missing(current) and current == applied:
+            still_applied = True
+    return concrete_applied and not still_applied
+
+
+def _discard_claude_takeover(data: dict[str, Any]) -> None:
+    """Remove a stale journal before explicitly taking over the current settings."""
+    state = data.get("runtime_state")
+    if not isinstance(state, dict):
+        return
+    claude_state = state.get(CLAUDE_TAKEOVER_KEY)
+    if not isinstance(claude_state, dict):
+        return
+    claude_state.pop("takeover", None)
+    if not claude_state:
+        state.pop(CLAUDE_TAKEOVER_KEY, None)
+    if not state:
+        data.pop("runtime_state", None)
+
+
+def _claude_compatibility_plan(
+    plan: ClaudeManagedPlan, settings: dict[str, Any], takeover: dict[str, Any] | None,
+    disabled_tools: list[str] | None,
+) -> ClaudeManagedPlan:
+    """Add gateway-specific tool compatibility without overwriting user denies."""
+    path = "/permissions/deny"
+    before = _pointer_get(settings, path)
+    if isinstance(takeover, dict):
+        entry = next(
+            (item for item in takeover.get("entries", [])
+             if isinstance(item, dict) and item.get("path") == path),
+            None,
+        )
+        if entry is not None:
+            before = _journal_before_value(entry)
+    if _is_missing(before):
+        original: list[str] = []
+    elif isinstance(before, list) and all(isinstance(item, str) for item in before):
+        original = list(dict.fromkeys(before))
+    else:
+        die("Claude Code settings.json 的 permissions.deny 必须是字符串数组；已停止，未修改配置。")
+    desired_deny = list(original)
+    for tool in _normalized_values(disabled_tools):
+        if tool not in desired_deny:
+            desired_deny.append(tool)
+    desired_value: Any = desired_deny if desired_deny else _MISSING
+    pointers = plan.desired_pointers
+    pointers[path] = desired_value
+    desired = dict(plan.desired)
+    desired[path] = desired_value
+    return ClaudeManagedPlan(
+        desired, tuple(pointers), plan.diagnostics, plan.supported, pointers,
+    )
+
+
 def _apply_claude_plan(
     settings: dict[str, Any], data: dict[str, Any], plan: ClaudeManagedPlan,
 ) -> dict[str, Any]:
@@ -1788,6 +1907,7 @@ def _apply_claude_plan(
             "target_path": str(CLAUDE_CODE_SETTINGS_PATH),
             "file_existed": CLAUDE_CODE_SETTINGS_PATH.exists(),
             "env_existed": isinstance(settings.get("env"), dict),
+            "permissions_existed": isinstance(settings.get("permissions"), dict),
             "original_mode": (
                 CLAUDE_CODE_SETTINGS_PATH.stat().st_mode & 0o777
                 if CLAUDE_CODE_SETTINGS_PATH.exists() else None
@@ -1870,6 +1990,9 @@ def _restore_claude_takeover(
     env = settings.get("env")
     if isinstance(env, dict) and not env and not takeover.get("env_existed", False):
         settings.pop("env", None)
+    permissions = settings.get("permissions")
+    if isinstance(permissions, dict) and not permissions and not takeover.get("permissions_existed", False):
+        settings.pop("permissions", None)
     return settings, conflicts
 
 
@@ -1890,9 +2013,12 @@ def claude_current_info() -> dict[str, Any]:
 
 
 def claude_provider_models(channel: dict[str, Any]) -> list[str]:
-    """Return usable Claude model candidates without mistaking partial maps for catalogs."""
+    """Return all saved candidates without letting an alias map shrink the catalog."""
     anthropic, runtime = _anthropic_profile_sections(channel)
     catalog = _normalized_values(anthropic.get("models"))
+    catalog.extend(_normalized_values(channel.get("claude_models")))
+    catalog.extend(_normalized_values(channel.get("models")))
+    catalog.extend(_normalized_values(channel.get("claude_selected_models")))
     model_map = runtime.get("model_map")
     if isinstance(model_map, dict) and all(
         isinstance(model_map.get(role), str) and model_map.get(role).strip()
@@ -1900,7 +2026,7 @@ def claude_provider_models(channel: dict[str, Any]) -> list[str]:
     ):
         mapped = [str(model_map[role]).strip() for role in CLAUDE_ROLES]
         return list(dict.fromkeys(mapped + catalog))
-    return catalog
+    return list(dict.fromkeys(catalog))
 
 
 def _parse_model_map(values: list[str] | None, map_all: str | None = None) -> dict[str, str] | None:
@@ -1935,6 +2061,7 @@ def select_claude_code_channel(
     model: str | None = None,
     selected_models: list[str] | None = None,
     selected_efforts: list[str] | None = None,
+    disabled_tools: list[str] | None = None,
     dry_run: bool = False,
 ) -> None:
     """Activate a complete explicit Claude profile; ``model`` is map-all only."""
@@ -1950,6 +2077,7 @@ def select_claude_code_channel(
     profile = _claude_profile(
         channel, anthropic_base_url=anthropic_base_url, model_map=model_map,
         default_role=default_role, effort=effort, auth_mode=auth_mode,
+        disabled_tools=disabled_tools,
     )
     plan = compile_claude_managed_values(profile)
     if not plan.supported:
@@ -1961,6 +2089,10 @@ def select_claude_code_channel(
         print_field("默认 alias", plan.desired["/model"])
         for role in CLAUDE_ROLES:
             print_field(f"{role} →", plan.desired[f"/env/ANTHROPIC_DEFAULT_{role.upper()}_MODEL"])
+        _, preview_runtime = _anthropic_profile_sections(profile)
+        preview_disabled = _normalized_values(preview_runtime.get("disabled_tools"))
+        if preview_disabled:
+            print_field("兼容禁用", ", ".join(preview_disabled), tone="warn")
         print_note("预演完成：未读取密钥，未修改配置。", kind="ok")
         return
     protocols = profile["protocols"]
@@ -1979,7 +2111,19 @@ def select_claude_code_channel(
     # true zero-write refusal.
     conflicts = _takeover_conflicts(settings, takeover)
     if conflicts:
-        die("Claude Code settings 在上次启用后被外部修改，拒绝覆盖：" + ", ".join(conflicts))
+        if _claude_takeover_is_detached(settings, takeover):
+            # The whole managed surface disappeared, so this is no longer a
+            # three-way merge. An explicit `use` becomes a fresh takeover of
+            # the current settings file; partial edits still fail closed.
+            _discard_claude_takeover(data)
+            takeover = None
+            print_note("检测到旧 Claude 接管记录与当前 settings.json 脱离；将以当前配置重新建立恢复基线。", kind="warn")
+        else:
+            die("Claude Code settings 在上次启用后被外部修改，拒绝覆盖：" + ", ".join(conflicts))
+    _, compatibility_runtime = _anthropic_profile_sections(profile)
+    plan = _claude_compatibility_plan(
+        plan, settings, takeover, _normalized_values(compatibility_runtime.get("disabled_tools")),
+    )
     backup = claude_settings_backup(settings)
     channels_before = CHANNELS_PATH.read_bytes() if CHANNELS_PATH.exists() else None
     settings_before = CLAUDE_CODE_SETTINGS_PATH.read_bytes() if CLAUDE_CODE_SETTINGS_PATH.exists() else None
@@ -2000,6 +2144,7 @@ def select_claude_code_channel(
             "claude_model_map": runtime["model_map"],
             "claude_default_role": runtime["default_role"],
             "claude_effort": runtime["effort"],
+            "claude_disabled_tools": _normalized_values(runtime.get("disabled_tools")),
             "claude_auth_mode": anthropic["auth"]["mode"],
             "claude_enabled": True,
             "claude_last_enabled_at": datetime.now(timezone.utc).isoformat(),
@@ -2030,6 +2175,9 @@ def select_claude_code_channel(
     print_field("思考强度", runtime["effort"], tone="accent")
     for role in CLAUDE_ROLES:
         print_field(f"{role} →", runtime["model_map"][role])
+    disabled = _normalized_values(runtime.get("disabled_tools"))
+    if disabled:
+        print_field("兼容禁用", ", ".join(disabled), tone="warn")
     if backup:
         print_note(f"已写入脱敏备份：{backup}")
     print_note("Claude Code 新会话会读取新配置；运行中的会话请重启。", kind="warn")
@@ -2103,7 +2251,8 @@ def deactivate_claude_code_channel(slug: str | None = None, *, quiet: bool = Fal
 def configure_claude_code_channel(
     slug: str | None = None, *, anthropic_base_url: str | None = None,
     model_map: dict[str, str] | None = None, default_role: str | None = None,
-    effort: str | None = None, auth_mode: str | None = None, dry_run: bool = False,
+    effort: str | None = None, auth_mode: str | None = None,
+    disabled_tools: list[str] | None = None, dry_run: bool = False,
 ) -> None:
     slug = slug or choose_channel("Claude Code：选择渠道", runtime="claude")
     if not slug:
@@ -2168,7 +2317,8 @@ def configure_claude_code_channel(
             return
     select_claude_code_channel(
         slug, anthropic_base_url=anthropic_base_url, model_map=model_map,
-        default_role=default_role, effort=effort, auth_mode=auth_mode, dry_run=dry_run,
+        default_role=default_role, effort=effort, auth_mode=auth_mode,
+        disabled_tools=disabled_tools, dry_run=dry_run,
     )
 
 
@@ -2177,9 +2327,32 @@ def print_claude_code_status() -> None:
     data = load_channels()
     active = data.get("claude_active")
     channel = data.get("channels", {}).get(active) if active else None
+    applied = False
+    if isinstance(channel, dict):
+        plan = compile_claude_managed_values(_claude_profile(channel))
+        if plan.supported:
+            takeover = _validate_claude_takeover(data)
+            _, status_runtime = _anthropic_profile_sections(channel)
+            plan = _claude_compatibility_plan(
+                plan, info["settings"], takeover,
+                _normalized_values(status_runtime.get("disabled_tools")),
+            )
+            applied = all(
+                _pointer_get(info["settings"], path) == value
+                for path, value in plan.pointer_values.items()
+            )
     print_heading("Claude Code 当前配置")
     print_field("配置文件", CLAUDE_CODE_SETTINGS_PATH)
-    print_field("当前渠道", f"{channel.get('name', active)} ({active})" if channel else "官方 Anthropic / 未登记", tone="ok" if channel else "warn")
+    if channel and applied:
+        current_channel = f"{channel.get('name', active)} ({active})"
+        channel_tone = "ok"
+    elif channel:
+        current_channel = f"{channel.get('name', active)} ({active}) · 注册表记录未应用"
+        channel_tone = "warn"
+    else:
+        current_channel = "官方 Anthropic / 未登记"
+        channel_tone = "warn"
+    print_field("当前渠道", current_channel, tone=channel_tone)
     print_field("Base URL", info["base_url"])
     print_field("默认模型", info["model"], tone="accent")
     print_field("思考强度", info["effort"], tone="accent")
@@ -2190,6 +2363,11 @@ def print_claude_code_status() -> None:
         model_map = runtime.get("model_map") if isinstance(runtime.get("model_map"), dict) else {}
         for role in CLAUDE_ROLES:
             print_field(f"{role} →", model_map.get(role, "未配置"), tone="accent" if role in model_map else "warn")
+        disabled = _normalized_values(runtime.get("disabled_tools"))
+        if disabled:
+            print_field("兼容禁用", ", ".join(disabled), tone="warn")
+        if not applied:
+            print_note("settings.json 未应用该渠道。执行 Claude Code 的“切换”即可重新接管当前配置。", kind="warn")
     if isinstance(data.get("claude_fallback"), dict):
         print_note("存在旧版 Claude fallback 快照：其恢复语义为 legacy/ambiguous。", kind="warn")
 
@@ -3074,7 +3252,7 @@ def fetch_models(base_url: str, api_key: str) -> tuple[ModelList, str | None]:
         },
     )
     try:
-        with urllib.request.urlopen(request, timeout=20) as response:
+        with urllib.request.urlopen(request, timeout=20, context=system_ssl_context()) as response:
             raw = response.read(8_000_000)
             if response.status < 200 or response.status >= 300:
                 return ModelList(), f"HTTP {response.status}"
@@ -4245,6 +4423,10 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--default-role", choices=CLAUDE_ROLES)
         command.add_argument("--effort", choices=CLAUDE_EFFORTS)
         command.add_argument(
+            "--disable-tool", dest="disabled_tools", action="append", default=None,
+            metavar="TOOL", help="为该 Claude 渠道禁用不兼容工具，可重复（例如 Task）",
+        )
+        command.add_argument(
             "--auth-mode", default=None,
             choices=("api_key_helper", "auth_token", "api_key", "bearer", "plaintext"),
             help="持久配置仅支持 api_key_helper；其他模式会明确拒绝",
@@ -4349,6 +4531,7 @@ def main() -> None:
             "default_role": args.default_role,
             "effort": args.effort,
             "auth_mode": args.auth_mode,
+            "disabled_tools": args.disabled_tools,
             "dry_run": args.dry_run,
         }
         if args.action == "status":
