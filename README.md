@@ -1,6 +1,6 @@
 # Gate Switch（`sgate`）
 
-当前版本：**2.0.0**。要求 Python 3.10+；脚本在导入其他现代语法前会对过旧解释器给出可操作提示。
+当前版本：**2.0.3**。要求 Python 3.10+；脚本在导入其他现代语法前会对过旧解释器给出可操作提示。
 
 `sgate` 是一个面向 macOS 的 Codex / OpenCode / Claude Code / Claude Desktop Code tab / ChatGPT.app 渠道切换脚本。它可以保存多个兼容渠道，自动拉取模型，并通过终端复选界面配置模型与推理强度。
 
@@ -120,6 +120,12 @@ sgate claude-code status
 sgate claude-code use fusiongate \
   --anthropic-base-url https://anthropic-gateway.example \
   --map-all claude-sonnet-5 --default-role sonnet --effort high --dry-run
+
+# 为不兼容的第三方网关禁用工具（可重复），通过 permissions.deny 精确合并，不覆盖已有 deny 项
+sgate claude-code use fusiongate \
+  --anthropic-base-url https://anthropic-gateway.example \
+  --map opus=claude-opus-5 --map sonnet=claude-sonnet-5 --map haiku=claude-haiku-5 \
+  --default-role sonnet --effort high --disable-tool Task
 
 # 真实 POST /v1/messages 诊断；只发送固定的 health check，不记录用户提示或密钥
 sgate claude-doctor fusiongate
