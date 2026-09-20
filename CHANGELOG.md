@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.0.4 - 2026-09-20
+
+- 修复 Claude Code 上下文窗口后缀导致的误判：Claude Code 会在 `settings.json` 的 `/model` 字段追加 `[1m]`、`[200k]` 等上下文窗口后缀（如 `opus[1m]`），SGate 写入的是裸角色名（如 `opus`），此前 journal 对比视为外部修改并拒绝覆盖。现在对 `/model` 路径的冲突检测、停用恢复与脱离判定均忽略该后缀，消除误报。
+
 ## 2.0.3 - 2026-08-13
 
 - 修复 Claude Code 切换失败：当 `settings.json` 被其他工具整体替换（SGate 的 applied 值无一生还，即使新配置复用了 `ANTHROPIC_BASE_URL` 等键名）时，下一次显式切换自动以当前文件重新建立恢复基线，而不是报“拒绝覆盖”卡死；部分外部修改仍 fail-closed。

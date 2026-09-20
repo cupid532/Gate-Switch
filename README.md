@@ -1,6 +1,6 @@
 # Gate Switch（`sgate`）
 
-当前版本：**2.0.3**。要求 Python 3.10+；脚本在导入其他现代语法前会对过旧解释器给出可操作提示。
+当前版本：**2.0.4**。要求 Python 3.10+；脚本在导入其他现代语法前会对过旧解释器给出可操作提示。
 
 `sgate` 是一个面向 macOS 的 Codex / OpenCode / Claude Code / Claude Desktop Code tab / ChatGPT.app 渠道切换脚本。它可以保存多个兼容渠道，自动拉取模型，并通过终端复选界面配置模型与推理强度。
 

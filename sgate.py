@@ -40,7 +40,7 @@ from pathlib import Path
 from typing import Any
 
 MIN_PYTHON = (3, 10)
-VERSION = "2.0.3"
+VERSION = "2.0.4"
 if sys.version_info < MIN_PYTHON:
     print(
         "SGate 需要 Python 3.10 或更高版本；当前为 "
@@ -1801,6 +1801,27 @@ def _validate_claude_takeover(data: dict[str, Any]) -> dict[str, Any] | None:
     return takeover
 
 
+def _strip_claude_context_suffix(value: Any) -> Any:
+    """Strip an optional Claude Code context-window suffix from a model value.
+
+    Claude Code appends bracket suffixes such as ``[1m]`` or ``[200k]`` to the
+    ``/model`` field in ``settings.json`` to indicate the chosen context window.
+    SGate writes bare role names (e.g. ``opus``), so the comparison must ignore
+    these suffixes to avoid false "external modification" conflicts.
+    """
+    if isinstance(value, str):
+        stripped = re.sub(r"\[\d+[kmKM]\]$", "", value)
+        return stripped if stripped else value
+    return value
+
+
+def _claude_model_matches(local: Any, reference: Any) -> bool:
+    """Compare /model values allowing for Claude Code context-window suffixes."""
+    if local == reference:
+        return True
+    return _strip_claude_context_suffix(local) == _strip_claude_context_suffix(reference)
+
+
 def _takeover_conflicts(settings: dict[str, Any], takeover: dict[str, Any] | None) -> list[str]:
     if takeover is None:
         return []
@@ -1810,8 +1831,12 @@ def _takeover_conflicts(settings: dict[str, Any], takeover: dict[str, Any] | Non
         local = _pointer_get(settings, path)
         applied = _journal_entry_value(entry, "applied")
         before = _journal_before_value(entry)
-        if local != applied and local != before:
-            conflicts.append(path)
+        if path == "/model":
+            if not _claude_model_matches(local, applied) and not _claude_model_matches(local, before):
+                conflicts.append(path)
+        else:
+            if local != applied and local != before:
+                conflicts.append(path)
     return conflicts
 
 
@@ -1841,8 +1866,10 @@ def _claude_takeover_is_detached(settings: dict[str, Any], takeover: dict[str, A
             continue
         concrete_applied = True
         current = _pointer_get(settings, entry["path"])
-        if not _is_missing(current) and current == applied:
-            still_applied = True
+        if not _is_missing(current):
+            _eq = _claude_model_matches if entry["path"] == "/model" else lambda a, b: a == b
+            if _eq(current, applied):
+                still_applied = True
     return concrete_applied and not still_applied
 
 
@@ -1978,12 +2005,13 @@ def _restore_claude_takeover(
         except SystemExit:
             conflicts.append(f"{path} (restore credential unavailable)")
             continue
-        if local == applied:
+        _eq = _claude_model_matches if path == "/model" else lambda a, b: a == b
+        if _eq(local, applied):
             if _is_missing(before):
                 _pointer_delete(settings, path)
             else:
                 _pointer_set(settings, path, before)
-        elif local == before:
+        elif _eq(local, before):
             continue
         else:
             conflicts.append(path)
